@@ -524,29 +524,119 @@ function setAngularInput(element, value) {
   return true;
 }
 
-function setAngularSelect(element, value) {
-  if (!element || !value) return;
+// The popup stores gender as M/F/T while IRCTC labels the options "Male" /
+// "Female" / "Transgender", and some releases also use the full word as the
+// option value. Match on value, label and aliases instead of one exact string.
+const GENDER_ALIASES = {
+  m: ["m", "male"],
+  f: ["f", "female"],
+  t: ["t", "transgender"],
+};
+
+function optionMatchesTarget(option, target, aliases) {
+  const value = String(option.value || "").trim();
+  const label = (option.textContent || "").trim();
+  if (value === target || value.toUpperCase() === target.toUpperCase()) return true;
+  if (label.toUpperCase() === target.toUpperCase()) return true;
+  const accepted = aliases && aliases[target.toLowerCase()];
+  if (!accepted) return false;
+  return accepted.includes(value.toLowerCase()) || accepted.includes(label.toLowerCase());
+}
+
+function findSelectOption(element, value, aliases) {
+  const target = String(value || "").trim();
+  if (!target || !element || element.tagName !== "SELECT") return null;
+  return Array.from(element.options || []).find((o) => optionMatchesTarget(o, target, aliases)) || null;
+}
+
+// True when the control already shows the wanted value, or when it is not a
+// native select / does not offer that option — in both cases there is nothing
+// further this script can do, so the caller must not stall the booking on it.
+function selectIsSettled(element, value, aliases) {
+  if (!element || element.tagName !== "SELECT") return true;
+  const match = findSelectOption(element, value, aliases);
+  if (!match) return true;
+  return element.value === match.value;
+}
+
+// PrimeNG renders some dropdowns as a div with no value to assign, so the list
+// has to be opened and the matching item clicked. The overlay is normally
+// appended to <body>, but a global query would hit another row's list first and
+// flip that passenger's value, so prefer the items inside this host and only
+// fall back to the last visible panel.
+function dropdownItems(host) {
+  const own = host.querySelectorAll(
+    ".p-dropdown-items li, .ui-dropdown-items li, p-dropdownitem li, .p-select-items li, [role='option']"
+  );
+  if (own.length) return Array.from(own);
+
+  const panels = Array.from(
+    document.querySelectorAll(".p-dropdown-panel, .ui-dropdown-panel, .p-select-panel")
+  );
+  for (let i = panels.length - 1; i >= 0; i -= 1) {
+    if (!isVisible(panels[i])) continue;
+    const items = panels[i].querySelectorAll("li, [role='option']");
+    if (items.length) return Array.from(items);
+  }
+  return [];
+}
+
+function setPrimeNgSelect(host, value, aliases) {
+  const target = String(value || "").trim();
+  if (!target) return true;
+
+  const labelEl = host.querySelector(".p-dropdown-label, .ui-dropdown-label, .p-select-label");
+  const label = (labelEl ? labelEl.textContent : host.textContent || "").trim();
+  const accepted = aliases && aliases[target.toLowerCase()];
+  if (label.toUpperCase() === target.toUpperCase() || (accepted && accepted.includes(label.toLowerCase()))) {
+    return true;
+  }
+
+  const now = Date.now();
+  const lastTry = parseInt(host.dataset.autoSelectAt || "0", 10);
+  if (now - lastTry < 1200) return false;
+  host.dataset.autoSelectAt = String(now);
+
+  const trigger = host.querySelector(".p-dropdown-trigger, .ui-dropdown-trigger, .p-select-trigger");
+  (trigger || host).click();
+  setTimeout(() => {
+    for (const item of dropdownItems(host)) {
+      const text = (item.textContent || "").trim();
+      if (text.toUpperCase() === target.toUpperCase() || (accepted && accepted.includes(text.toLowerCase()))) {
+        item.click();
+        return;
+      }
+    }
+  }, 200);
+  return false;
+}
+
+function setAngularSelect(element, value, aliases) {
+  if (!element || !value) return false;
+  if (element.tagName !== "SELECT") return setPrimeNgSelect(element, value, aliases);
+
   const target = String(value).trim();
-  if (element.dataset.autofilled === target) return;
-
-  const options = Array.from(element.options || []);
-  const match =
-    options.find((o) => o.value === target) ||
-    options.find((o) => (o.textContent || "").trim().toUpperCase() === target.toUpperCase());
-
+  const match = findSelectOption(element, target, aliases);
   if (!match) {
-    // Mark as attempted so a non-existent option cannot re-fire change every tick.
-    element.dataset.autofilled = `__missing__:${target}`;
-    return;
+    // Option not rendered yet (freshly added row) — retry on the next tick.
+    return false;
   }
-  if (element.value === match.value) {
-    element.dataset.autofilled = target;
-    return;
-  }
+  if (element.value === match.value) return true;
+
+  // Angular re-creates these rows when a name suggestion is committed, and the
+  // rebuilt FormControl writes its default ("Male") back over the value we set.
+  // The old code trusted a dataset flag, so the visible value stayed wrong and
+  // was never retried. Re-apply instead, throttled so a value Angular keeps
+  // resetting cannot get a change event on every 250 ms tick.
+  const now = Date.now();
+  const lastTry = parseInt(element.dataset.autoSelectAt || "0", 10);
+  if (now - lastTry < 400) return false;
+  element.dataset.autoSelectAt = String(now);
 
   element.value = match.value;
+  element.dispatchEvent(new Event("input", { bubbles: true }));
   element.dispatchEvent(new Event("change", { bubbles: true }));
-  element.dataset.autofilled = target;
+  return element.value === match.value;
 }
 
 const MONTH_ABBR = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
@@ -926,6 +1016,14 @@ const PASSENGER_AGE_SELECTOR = 'input[formcontrolname="passengerAge"], input[pla
 
 const filledPassengerNames = new Map();
 const nameFillTries = new Map();
+// Tracks how long a gender/berth value has refused to stick, so the HUD only
+// warns after the retries have had a fair chance rather than on the first tick.
+const stuckSelectSince = new Map();
+// A value can read correct on the tick we write it and be reverted by Angular a
+// moment later, so the form is only ready after it has stayed correct briefly.
+let passengersSettledAt = 0;
+let passengersPendingSince = 0;
+const PASSENGER_SETTLE_MS = 400;
 let addPassengerClicks = 0;
 let lastAddPassengerClickAt = 0;
 let passengerStatePath = "";
@@ -955,6 +1053,9 @@ function syncPassengerState(list) {
     addPassengerClicks = 0;
     filledPassengerNames.clear();
     nameFillTries.clear();
+    stuckSelectSince.clear();
+    passengersSettledAt = 0;
+    passengersPendingSince = 0;
   }
 }
 
@@ -971,6 +1072,28 @@ function findPassengerRowScope(nameInput) {
   return best || nameInput.parentElement;
 }
 
+const GENDER_OPTION_TEXT_RE = /^(male|female|transgender)$/i;
+const BERTH_OPTION_TEXT_RE = /^(no pref(erence)?|lower|middle|upper|side lower|side upper|window side)$/i;
+
+// Rows created by "Add Passenger" sometimes drop the formcontrolname attribute,
+// so fall back to the control's own options: a select (or PrimeNG dropdown)
+// offering Male/Female is the gender field, one offering berth names is berth.
+function findRowControl(scope, controlName, optionTextRe) {
+  const named = scope.querySelector(
+    `select[formcontrolname="${controlName}"], p-dropdown[formcontrolname="${controlName}"]`
+  );
+  if (named) return named;
+
+  for (const select of scope.querySelectorAll("select")) {
+    const texts = Array.from(select.options || []).map((o) => (o.textContent || "").trim());
+    if (texts.length && texts.some((t) => optionTextRe.test(t))) return select;
+  }
+  for (const dropdown of scope.querySelectorAll("p-dropdown, .p-dropdown, .ui-dropdown, p-select")) {
+    if (optionTextRe.test((dropdown.textContent || "").trim())) return dropdown;
+  }
+  return null;
+}
+
 function collectPassengerRows() {
   return Array.from(document.querySelectorAll(PASSENGER_NAME_SELECTOR))
     .filter(isVisible)
@@ -979,8 +1102,8 @@ function collectPassengerRows() {
       return {
         name: nameInput,
         age: scope.querySelector(PASSENGER_AGE_SELECTOR),
-        gender: scope.querySelector('select[formcontrolname="passengerGender"]'),
-        berth: scope.querySelector('select[formcontrolname="passengerBerthChoice"]'),
+        gender: findRowControl(scope, "passengerGender", GENDER_OPTION_TEXT_RE),
+        berth: findRowControl(scope, "passengerBerthChoice", BERTH_OPTION_TEXT_RE),
       };
     });
 }
@@ -1021,6 +1144,17 @@ function isPassengerNameFilled(index, input, target) {
 function fillPassengerRows(rows, list) {
   let pending = false;
   let failedRow = 0;
+  let allSettled = true;
+  const stuckRows = [];
+
+  const noteStuck = (key, label, stuck) => {
+    if (!stuck) {
+      stuckSelectSince.delete(key);
+      return;
+    }
+    if (!stuckSelectSince.has(key)) stuckSelectSince.set(key, Date.now());
+    if (Date.now() - stuckSelectSince.get(key) > 2500) stuckRows.push(label);
+  };
 
   for (let i = 0; i < rows.length && i < list.length; i++) {
     const row = rows[i];
@@ -1047,18 +1181,41 @@ function fillPassengerRows(rows, list) {
 
     if (target && row.name && row.name.value.trim()) filledPassengerNames.set(i, target);
     if (row.age && list[i].age) setAngularInput(row.age, String(list[i].age).trim());
-    if (row.gender && list[i].gender) setAngularSelect(row.gender, list[i].gender);
-    if (row.berth && list[i].berth) setAngularSelect(row.berth, list[i].berth);
+
+    if (row.gender && list[i].gender) {
+      setAngularSelect(row.gender, list[i].gender, GENDER_ALIASES);
+      const settled = selectIsSettled(row.gender, list[i].gender, GENDER_ALIASES);
+      if (!settled) allSettled = false;
+      noteStuck(`${i}:gender`, `Passenger ${i + 1} gender`, !settled);
+    }
+    if (row.berth && list[i].berth) {
+      setAngularSelect(row.berth, list[i].berth);
+      const settled = selectIsSettled(row.berth, list[i].berth);
+      if (!settled) allSettled = false;
+      noteStuck(`${i}:berth`, `Passenger ${i + 1} berth`, !settled);
+    }
   }
 
-  return { done: !pending && !isFillingPassengerName, failedRow };
+  return { done: !pending && !isFillingPassengerName, failedRow, stuckRows, allSettled };
 }
 
-function arePassengerRowsComplete(rows, list) {
+function arePassengerRowsFilled(rows, list) {
   for (let i = 0; i < list.length; i++) {
     const row = rows[i];
     if (!row || !row.name || !row.name.value.trim()) return false;
     if (String(list[i].age || "").trim() && (!row.age || !row.age.value.trim())) return false;
+  }
+  return true;
+}
+
+function arePassengerRowsComplete(rows, list) {
+  if (!arePassengerRowsFilled(rows, list)) return false;
+  for (let i = 0; i < list.length; i++) {
+    const row = rows[i];
+    // A wrong gender/berth is a wrong ticket, so do not press Continue while a
+    // native select still shows something else than the configured value.
+    if (row.gender && list[i].gender && !selectIsSettled(row.gender, list[i].gender, GENDER_ALIASES)) return false;
+    if (row.berth && list[i].berth && !selectIsSettled(row.berth, list[i].berth)) return false;
   }
   return true;
 }
@@ -1584,6 +1741,30 @@ function runAutomationStep() {
     const fillResult = fillPassengerRows(rows, passengers);
     if (fillResult.failedRow) {
       rowWarning = `Passenger ${fillResult.failedRow} name not filled — type it manually`;
+    } else if (fillResult.stuckRows.length) {
+      rowWarning = `${fillResult.stuckRows.join(", ")} did not stick — set it manually`;
+    }
+
+    if (fillResult.done && fillResult.allSettled) {
+      if (!passengersSettledAt) passengersSettledAt = Date.now();
+    } else {
+      passengersSettledAt = 0;
+    }
+
+    // A value that passes one read and is reverted afterwards never reaches the
+    // stability window, so say so instead of silently holding Continue forever.
+    const rowsFilled = fillResult.done && arePassengerRowsFilled(rows, passengers);
+    if (rowsFilled) {
+      if (!passengersPendingSince) passengersPendingSince = Date.now();
+      const stable =
+        passengersSettledAt > 0 && Date.now() - passengersSettledAt >= PASSENGER_SETTLE_MS;
+      if (stable) {
+        passengersPendingSince = 0;
+      } else if (Date.now() - passengersPendingSince > 2500 && !rowWarning) {
+        rowWarning = "Passenger fields keep resetting — check gender/berth, then Continue";
+      }
+    } else {
+      passengersPendingSince = 0;
     }
 
     const mobileInp = document.querySelector('input[formcontrolname="mobileNumber"], input#mobileNumber');
@@ -1616,6 +1797,8 @@ function runAutomationStep() {
     const formReady =
       fillResult.done &&
       arePassengerRowsComplete(rows, passengers) &&
+      passengersSettledAt > 0 &&
+      Date.now() - passengersSettledAt >= PASSENGER_SETTLE_MS &&
       payMode.settled;
 
     if (formReady) {
