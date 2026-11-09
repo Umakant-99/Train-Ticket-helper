@@ -548,16 +548,21 @@ function collapseText(text) {
 
 // PrimeNG dropdowns keep the picked option in a label element, not in a value
 // property, so this is the only text that reflects what the passenger row shows.
-// Editable dropdowns render that label as an <input>, whose value is not text.
+// Editable dropdowns render that label as an <input>, whose value is not text;
+// before a pick it carries the placeholder instead, which is also how an added
+// row's field is recognised when it lost its formcontrolname.
 function controlLabelText(host) {
   if (!host) return "";
   const labelEl = host.querySelector(".p-dropdown-label, .ui-dropdown-label, .p-select-label");
   if (labelEl) {
-    const text = labelEl.tagName === "INPUT" ? labelEl.value : labelEl.textContent;
-    return collapseText(text).toUpperCase();
+    const isInput = labelEl.tagName === "INPUT";
+    const text = collapseText(isInput ? labelEl.value || labelEl.placeholder : labelEl.textContent);
+    if (text) return text.toUpperCase();
   }
   const input = host.querySelector("input[type='text'], input:not([type])");
-  if (input && input.value) return collapseText(input.value).toUpperCase();
+  if (input && (input.value || input.placeholder)) {
+    return collapseText(input.value || input.placeholder).toUpperCase();
+  }
   return collapseText(host.textContent).toUpperCase();
 }
 
@@ -657,45 +662,114 @@ function panelOptionItems(panel) {
 // still be driven with the control's own keyboard handler.
 const dropdownItemCache = new WeakMap();
 
-// PrimeNG renders some dropdowns as a div with no value to assign, so the list
-// has to be opened and the matching item clicked. The overlay is usually
-// appended to <body>; a global query would hit the other row's panel — or the
-// berth panel left in the DOM — and flip the wrong field. Prefer this host's own
-// panel, then the panel this host points at, then the visible panel that
-// actually lists the wanted option.
-function dropdownItems(host, target, aliases) {
-  const own = panelOptionItems(host).filter(isVisible);
-  if (own.length) return own;
+// PrimeNG appends every overlay to <body>, so the panels of all six passenger
+// rows look identical from the outside. Clicking "Female" in the wrong one sets
+// that other row instead — this is what left passenger 2 on "Male" while the
+// row below it went to "Female". Remember which overlay belongs to which host
+// and never touch a panel that belongs to someone else.
+const panelOwner = new WeakMap();
+const hostPanel = new WeakMap();
 
-  const linked = [];
+function linkedPanels(host) {
+  const panels = [];
+  if (!host || !host.querySelectorAll) return panels;
   for (const anchor of [host, ...host.querySelectorAll("[aria-controls], [aria-owns]")]) {
     const ref =
       anchor.getAttribute && (anchor.getAttribute("aria-controls") || anchor.getAttribute("aria-owns"));
     if (!ref) continue;
     for (const id of String(ref).split(/\s+/)) {
-      const panel = document.getElementById(id);
-      if (panel) linked.push(...panelOptionItems(panel));
+      const panel = id ? document.getElementById(id) : null;
+      if (panel && !panels.includes(panel)) panels.push(panel);
     }
   }
-  if (linked.length) return linked;
+  return panels;
+}
 
-  const panels = visibleDropdownPanels();
-  // Panels that were already on screen when this host was tapped belong to other
-  // fields (or a stale tap); the panel this tap opened is the one to use.
+// PrimeNG stamps the overlay with aria-labelledby pointing at the trigger's
+// label id, and newer releases give it "<triggerId>_panel".
+function panelBelongsTo(panel, host) {
+  if (!panel || !host) return false;
+  if (panelOwner.get(panel) === host) return true;
+  for (const ref of [panel.getAttribute("aria-labelledby"), panel.getAttribute("aria-controls")]) {
+    for (const id of String(ref || "").split(/\s+/)) {
+      if (!id) continue;
+      const el = document.getElementById(id);
+      if (el && (el === host || host.contains(el))) return true;
+    }
+  }
+  const hostId = host.id || (host.querySelector("[id]") || {}).id;
+  if (hostId && panel.id && (panel.id === `${hostId}_panel` || panel.id.startsWith(`${hostId}_`))) {
+    return true;
+  }
+  return false;
+}
+
+function panelHasTarget(panel, target, aliases) {
+  if (!target) return true;
+  return panelOptionItems(panel).some((item) => labelMatchesTarget(item.textContent, target, aliases));
+}
+
+// The panel a tap just opened is the only one this host may use. Claiming it
+// once means later retries keep targeting it even after other rows open theirs.
+// Some releases give the overlay no aria link at all, so the option text it
+// lists (gender vs berth) is the next best evidence of the owner.
+function claimPanelForHost(host, before, target, aliases) {
+  const tracked = hostPanel.get(host);
+  if (tracked && tracked.isConnected && isVisible(tracked)) return tracked;
+
+  const fresh = visibleDropdownPanels().filter(
+    (panel) => !(before || []).includes(panel) && !panelOwner.has(panel)
+  );
+  if (!fresh.length) return null;
+
+  const claim = (panel) => {
+    panelOwner.set(panel, host);
+    hostPanel.set(host, panel);
+    return panel;
+  };
+
+  const linked = fresh.find((panel) => panelBelongsTo(panel, host));
+  if (linked) return claim(linked);
+
+  const withTarget = fresh.filter((panel) => panelHasTarget(panel, target, aliases));
+  if (withTarget.length === 1) return claim(withTarget[0]);
+  const pool = withTarget.length ? withTarget : fresh;
+  if (pool.length === 1) return claim(pool[0]);
+  return null;
+}
+
+// PrimeNG renders some dropdowns as a div with no value to assign, so the list
+// has to be opened and the matching item clicked. Only panels owned by this
+// host are considered; if none can be identified the caller falls back to the
+// component's own keyboard handling instead of guessing another row's overlay.
+function dropdownItems(host, target, aliases) {
+  const own = panelOptionItems(host).filter(isVisible);
+  if (own.length) return own;
+
+  const panels = linkedPanels(host);
+  const tracked = hostPanel.get(host);
+  if (tracked && tracked.isConnected && !panels.includes(tracked)) panels.push(tracked);
+
+  const visible = visibleDropdownPanels();
   const before = host.__tatkalPanelsBefore || [];
-  const fresh = panels.filter((panel) => !before.includes(panel));
-  const preferred = fresh.length ? fresh : panels;
-  if (target) {
-    const matching = preferred.filter((panel) =>
-      panelOptionItems(panel).some((item) => labelMatchesTarget(item.textContent, target, aliases))
-    );
-    if (matching.length) return panelOptionItems(matching[matching.length - 1]);
+  for (const panel of visible) {
+    if (panels.includes(panel) || panelOwner.has(panel)) continue;
+    if (panelBelongsTo(panel, host)) {
+      panelOwner.set(panel, host);
+      hostPanel.set(host, panel);
+      panels.push(panel);
+    } else if (visible.length === 1 && !before.includes(panel) && panelHasTarget(panel, target, aliases)) {
+      // Nothing else was open before this tap and nothing else is on screen now,
+      // so the overlay cannot belong to another row.
+      panelOwner.set(panel, host);
+      hostPanel.set(host, panel);
+      panels.push(panel);
+    }
   }
-  for (let i = preferred.length - 1; i >= 0; i -= 1) {
-    const items = panelOptionItems(preferred[i]);
-    if (items.length) return items;
-  }
-  return [];
+
+  const items = [];
+  for (const panel of panels) items.push(...panelOptionItems(panel));
+  return items;
 }
 
 function clickDropdownItem(host, target, aliases) {
@@ -709,6 +783,11 @@ function clickDropdownItem(host, target, aliases) {
     dropdownItemCache.set(host, items.map((item) => collapseText(item.textContent)));
   }
   for (const item of items) {
+    const panel = item.closest(DROPDOWN_PANEL_SELECTOR);
+    const owner = panel ? panelOwner.get(panel) : null;
+    // Never click inside an overlay another row claimed, even if it somehow
+    // reached this list.
+    if (owner && owner !== host && owner.isConnected) continue;
     if (!labelMatchesTarget(item.textContent, target, aliases)) continue;
     clickLikeUser(item);
     return true;
@@ -716,22 +795,93 @@ function clickDropdownItem(host, target, aliases) {
   return false;
 }
 
+// PrimeNG reads these keys from `key`, and older releases from `which`/`keyCode`,
+// which a plain KeyboardEvent init leaves at 0.
+const KEY_CODES = {
+  ArrowDown: 40,
+  ArrowUp: 38,
+  Home: 36,
+  End: 35,
+  Enter: 13,
+  Escape: 27,
+};
+
+function fireKey(el, type, key) {
+  const code = KEY_CODES[key] || 0;
+  const ev = new KeyboardEvent(type, {
+    key,
+    code: key === " " ? "Space" : key,
+    bubbles: true,
+    cancelable: true,
+  });
+  if (ev.keyCode !== code) {
+    Object.defineProperty(ev, "keyCode", { get: () => code });
+    Object.defineProperty(ev, "which", { get: () => code });
+  }
+  el.dispatchEvent(ev);
+}
+
 // Some builds stop honouring synthetic item clicks once the overlay has
-// re-rendered mid-animation. The component's own keyboard handling still works:
-// open, step to the option, confirm.
+// re-rendered mid-animation. The component's own keyboard handling only ever
+// touches its own panel, so it cannot flip a neighbouring passenger's row.
 function keyboardPickOption(host, index) {
   const container = dropdownContainer(host);
-  if (!container || !container.focus) return false;
-  container.focus();
-  const fire = (key) => {
-    container.dispatchEvent(new KeyboardEvent("keydown", { key, bubbles: true, cancelable: true }));
-    container.dispatchEvent(new KeyboardEvent("keyup", { key, bubbles: true, cancelable: true }));
+  if (!container) return false;
+  const targetEl = container.querySelector("input") || container;
+  if (targetEl.focus) targetEl.focus();
+  const press = (key) => {
+    fireKey(targetEl, "keydown", key);
+    fireKey(targetEl, "keyup", key);
   };
-  fire("ArrowDown");
-  fire("Home");
-  for (let i = 0; i < index; i += 1) fire("ArrowDown");
-  fire("Enter");
+  press("ArrowDown");
+  press("Home");
+  for (let i = 0; i < index; i += 1) press("ArrowDown");
+  press("Enter");
   return true;
+}
+
+// The index has to come from this control's own option list, or from a list of
+// the same kind (every passenger's gender dropdown lists the same options), or
+// the keyboard would land on the wrong entry.
+function targetOptionIndex(target, aliases) {
+  for (const panel of visibleDropdownPanels()) {
+    const texts = panelOptionItems(panel).map((item) => collapseText(item.textContent));
+    const index = texts.findIndex((text) => labelMatchesTarget(text, target, aliases));
+    if (index >= 0) return index;
+  }
+  return -1;
+}
+
+function keyboardPickFromPanel(host, target, aliases) {
+  const panel = hostPanel.get(host) || linkedPanels(host)[0] || null;
+  let texts = [];
+  if (panel) {
+    const items = panelOptionItems(panel).map((item) => collapseText(item.textContent));
+    if (items.length) {
+      texts = items;
+      dropdownItemCache.set(host, items);
+    }
+  }
+  if (!texts.length) texts = dropdownItemCache.get(host) || [];
+  let index = texts.findIndex((text) => labelMatchesTarget(text, target, aliases));
+  if (index < 0) index = targetOptionIndex(target, aliases);
+  if (index < 0) return false;
+  return keyboardPickOption(host, index);
+}
+
+// Printed once per control so a live run can be diagnosed without guesswork.
+function logStuckDropdown(host, target) {
+  const panel = hostPanel.get(host);
+  console.log(
+    `[Tatkal] Dropdown still "${controlLabelText(host) || "empty"}" instead of "${target}"`,
+    {
+      host: (host.outerHTML || "").slice(0, 300),
+      hostPanel: panel ? panel.id || panel.className : "none",
+      linkedPanels: linkedPanels(host).length,
+      visiblePanels: visibleDropdownPanels().map((p) => p.id || p.className),
+      seenItems: (dropdownItemCache.get(host) || []).join(" | "),
+    }
+  );
 }
 
 function setPrimeNgSelect(host, value, aliases) {
@@ -751,25 +901,43 @@ function setPrimeNgSelect(host, value, aliases) {
   host.dataset.autoSelectAt = String(now);
   host.dataset.autoSelectTries = String(tries);
 
-  if (tries > 3) {
-    const seen = dropdownItemCache.get(host) || [];
-    const index = seen.findIndex((text) => labelMatchesTarget(text, target, aliases));
-    if (index >= 0) keyboardPickOption(host, index);
-    return false;
-  }
+  // Re-opening a panel that is already on screen just closes it (PrimeNG toggles
+  // on the trigger), which is how a missed item click kept leaving a row on its
+  // default: every other retry wasted itself toggling instead of clicking.
+  const trackedPanel = hostPanel.get(host);
+  const panelOpen = !!(trackedPanel && trackedPanel.isConnected && isVisible(trackedPanel));
+  const before = visibleDropdownPanels().filter((panel) => panel !== trackedPanel);
+  host.__tatkalPanelsBefore = before;
+  if (!panelOpen) clickLikeUser(dropdownContainer(host));
 
-  host.__tatkalPanelsBefore = visibleDropdownPanels();
-  clickLikeUser(dropdownContainer(host));
+  const settled = () =>
+    !host.isConnected || labelMatchesTarget(controlLabelText(host), target, aliases);
 
   // The overlay is rendered a moment after the tap, so look for the item a few
   // times instead of one shot; a single miss left the row on its default.
   for (const delay of [50, 150, 350, 700]) {
     setTimeout(() => {
-      if (!host.isConnected) return;
-      if (labelMatchesTarget(controlLabelText(host), target, aliases)) return;
+      if (settled()) return;
+      claimPanelForHost(host, before, target, aliases);
       clickDropdownItem(host, target, aliases);
     }, delay);
   }
+
+  // Item clicks are the first route; the keyboard is the safety net for a build
+  // that ignores them, and for a retry whose panel had already closed. Neither
+  // path is allowed to give up: Angular can rebuild a row and reset its value
+  // seconds later, so the value keeps being re-applied until it sticks.
+  if (tries >= 3) {
+    setTimeout(() => {
+      if (settled()) return;
+      claimPanelForHost(host, before, target, aliases);
+      clickDropdownItem(host, target, aliases);
+      if (settled()) return;
+      keyboardPickFromPanel(host, target, aliases);
+    }, 950);
+  }
+
+  if (tries === 8) logStuckDropdown(host, target);
   return false;
 }
 
@@ -1314,7 +1482,7 @@ function passengerControlPools() {
 function collectPassengerRows() {
   const nameInputs = Array.from(document.querySelectorAll(PASSENGER_NAME_SELECTOR)).filter(isVisible);
   const pools = passengerControlPools();
-  return nameInputs.map((nameInput, index) => {
+  const rows = nameInputs.map((nameInput, index) => {
     const scope = findPassengerRowScope(nameInput) || document;
     const row = {
       name: nameInput,
@@ -1328,6 +1496,21 @@ function collectPassengerRows() {
     if (!row.berth && pools.berth.length >= nameInputs.length) row.berth = pools.berth[index];
     return row;
   });
+
+  // One control cannot be two passengers' field. If the scope walk handed the
+  // same dropdown to two rows, the later row must report it missing: otherwise
+  // the gate would read the neighbour's value and let Continue through with this
+  // row still on IRCTC's default.
+  const taken = new Set();
+  for (const row of rows) {
+    for (const key of ["gender", "berth"]) {
+      const el = row[key];
+      if (!el) continue;
+      if (taken.has(el)) row[key] = null;
+      else taken.add(el);
+    }
+  }
+  return rows;
 }
 
 // The psgninput header prints the date the ticket is actually booked for
