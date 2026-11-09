@@ -1284,6 +1284,67 @@ function fillSingleStation(inputEl, stationCode) {
 
 let isFillingPassengerName = false;
 
+const AUTOCOMPLETE_ITEM_SELECTOR =
+  ".p-autocomplete-panel li, .ui-autocomplete-panel li, .p-autocomplete-items li, .ui-autocomplete-items li, ul[role='listbox'] li";
+// Older PrimeNG renders a dropdown's options as ul[role=listbox] too, so a
+// panel opened for gender/berth while a name is filling must not be taken for
+// the suggestion list.
+const SELECT_PANEL_SELECTOR =
+  ".p-dropdown-panel, .ui-dropdown-panel, .p-select-panel, .p-select-overlay, .ui-select-panel";
+const AUTOCOMPLETE_WAIT_MS = 1200;
+
+function suggestionItems() {
+  const items = Array.from(document.querySelectorAll(AUTOCOMPLETE_ITEM_SELECTOR)).filter(
+    (li) => !li.closest(SELECT_PANEL_SELECTOR)
+  );
+  const visible = items.filter(isVisible);
+  // A panel can exist one frame before it has a box, so keep the raw list as a
+  // fallback instead of timing out on a list that is already rendered.
+  return visible.length ? visible : items;
+}
+
+// The suggestion list arrives on a debounced request, so react to the DOM
+// instead of polling a timer: the first mutation that shows the panel wins.
+function waitForSuggestion(input, target) {
+  let observer = null;
+  let giveUp = 0;
+  let done = false;
+
+  const finish = (picked) => {
+    if (done) return;
+    done = true;
+    if (observer) observer.disconnect();
+    clearTimeout(giveUp);
+    if (!picked) {
+      isFillingPassengerName = false;
+      return;
+    }
+    // Angular re-renders the row when the suggestion applies, so hold the queue
+    // briefly rather than filling the next row into the render being replaced.
+    setTimeout(() => {
+      isFillingPassengerName = false;
+    }, 300);
+  };
+
+  const tryPick = () => {
+    if (done) return;
+    const items = suggestionItems();
+    if (!items.length) return;
+    const wanted = target.toUpperCase();
+    const item =
+      items.find((li) => collapseText(li.textContent).toUpperCase().includes(wanted)) || items[0];
+    item.click();
+    input.dataset.passengerFilled = target;
+    finish(true);
+  };
+
+  tryPick();
+  if (done) return;
+  observer = new MutationObserver(tryPick);
+  observer.observe(document.body || document.documentElement, { childList: true, subtree: true });
+  giveUp = setTimeout(() => finish(false), AUTOCOMPLETE_WAIT_MS);
+}
+
 function fillPassengerName(input, name) {
   if (!input || !name || isFillingPassengerName) return;
   const target = name.trim();
@@ -1303,30 +1364,7 @@ function fillPassengerName(input, name) {
   setNativeValue(input, target);
   input.dispatchEvent(new InputEvent("input", { bubbles: true, data: target, inputType: "insertText" }));
 
-  let polls = 0;
-  const timer = setInterval(() => {
-    polls += 1;
-    const items = document.querySelectorAll(
-      ".p-autocomplete-panel li, .ui-autocomplete-panel li, .p-autocomplete-items li, .ui-autocomplete-items li, ul[role='listbox'] li"
-    );
-
-    if (items.length > 0) {
-      clearInterval(timer);
-      let picked = null;
-      items.forEach((li) => {
-        const txt = (li.innerText || "").toUpperCase();
-        if (!picked && txt.includes(target.toUpperCase())) picked = li;
-      });
-      (picked || items[0]).click();
-      input.dataset.passengerFilled = target;
-      setTimeout(() => {
-        isFillingPassengerName = false;
-      }, 300);
-    } else if (polls >= 8) {
-      clearInterval(timer);
-      isFillingPassengerName = false;
-    }
-  }, 150);
+  waitForSuggestion(input, target);
 }
 
 // ============================================================================
@@ -1486,19 +1524,33 @@ function passengerControlPools() {
   };
 }
 
+// Reading a rect forces layout, and the mapping below reads every control once
+// per row. Caching rects for a single collection pass turns that
+// O(rows × controls) into O(controls) exactly when Angular is still rendering.
+let rectCache = new Map();
+
+function rectOf(el) {
+  let rect = rectCache.get(el);
+  if (!rect) {
+    rect = el.getBoundingClientRect();
+    rectCache.set(el, rect);
+  }
+  return rect;
+}
+
 // Rows created by "Add Passenger" can drop the formcontrolname attribute and
 // sit in wrappers of their own shape, so the DOM cannot say which gender
 // dropdown belongs to which row. What the page does guarantee is layout: one
 // row per visual line, in the order name, age, gender, country, berth. Any
 // dropdown sharing the name input's line is therefore this row's.
 function rowLineControls(nameInput, controls) {
-  const box = nameInput.getBoundingClientRect();
+  const box = rectOf(nameInput);
   if (box.height <= 0) return [];
   const centerY = box.top + box.height / 2;
   // Half a row height: a neighbouring row's fields are a full row away.
   const tolerance = Math.max(14, box.height * 0.75);
   return controls
-    .map((el) => ({ el, rect: el.getBoundingClientRect() }))
+    .map((el) => ({ el, rect: rectOf(el) }))
     .filter(
       ({ rect }) =>
         rect.width > 0 &&
@@ -1527,6 +1579,7 @@ function lineRowControls(nameInput, controls, claimed) {
 }
 
 function collectPassengerRows() {
+  rectCache = new Map();
   const nameInputs = Array.from(document.querySelectorAll(PASSENGER_NAME_SELECTOR)).filter(isVisible);
   const pools = passengerControlPools();
   const claimed = new Set();
@@ -1674,6 +1727,8 @@ function logMissingRowControl(index, key, row) {
   const id = `${index}:${key}`;
   if (missingRowControlLogged.has(id)) return;
   missingRowControlLogged.add(id);
+  // Fields were written since the collection pass, so its rects are stale.
+  rectCache = new Map();
   const controls = uniqueControls(document).filter(isVisible);
   const describe = (el) => ({
     tag: el.tagName,
