@@ -127,20 +127,20 @@ function trackBusyOverlay() {
   return false;
 }
 
-function canAutoSubmit() {
+function canAutoSubmit(maxAttempts = MAX_SUBMIT_ATTEMPTS) {
   const path = window.location.pathname;
   if (submitState.pathname !== path) {
     submitState = { pathname: path, timestamp: 0, count: 0 };
   }
   if (submitState.count === 0) return true;
-  if (submitState.count >= MAX_SUBMIT_ATTEMPTS) return false;
+  if (submitState.count >= maxAttempts) return false;
   // Retry only when the first click clearly did nothing.
   return Date.now() - submitState.timestamp > SUBMIT_RETRY_DELAY_MS && !isSubmissionInFlight();
 }
 
-function clickSubmitOnce(btn, label) {
+function clickSubmitOnce(btn, label, maxAttempts = MAX_SUBMIT_ATTEMPTS) {
   if (!btn || !isVisible(btn) || btn.disabled) return false;
-  if (!canAutoSubmit()) return false;
+  if (!canAutoSubmit(maxAttempts)) return false;
 
   submitState.timestamp = Date.now();
   submitState.count += 1;
@@ -270,10 +270,13 @@ function selectBhimUpiPaymentMode() {
 }
 
 // Payment-options page selectors. `div` is deliberately absent: matching every
-// div (as the old scan did) makes reading text a layout pass per element.
+// div (as the old scan did) makes reading text a layout pass per element. The
+// bare li/span/label entries stay on the option list because the card markup
+// differs between IRCTC releases; its result is cached, so it is only scanned
+// while the option is still missing.
 const PAYMENT_TAB_SELECTOR =
-  "[class*='bank-type'], .nav-tabs li, .nav-tabs a, li[role='tab'], [role='tab'], li, a, span";
-const PAYMENT_OPTION_SELECTOR = "div.bank-text, .bank-box, .col-xs-12, label, li, span";
+  "[class*='bank-type'], [class*='nav-tab'], .nav-tabs li, .nav-tabs a, [role='tab']";
+const PAYMENT_OPTION_SELECTOR = "[class*='bank-text'], .bank-box, .col-xs-12, label, li, span";
 
 function isBhimUpiTabText(t) {
   return (
@@ -338,7 +341,7 @@ function findTextHost(matcher) {
 }
 
 const textHostProbes = new Map();
-const TEXT_HOST_PROBE_TTL_MS = 600;
+const TEXT_HOST_PROBE_TTL_MS = 800;
 
 function probeTextHost(key, matcher) {
   const now = Date.now();
@@ -350,6 +353,8 @@ function probeTextHost(key, matcher) {
   return host;
 }
 
+const SELECTED_CLASS_RE = /(^|-)(active|selected|checked|highlight)$/i;
+
 function findPaymentTab() {
   return (
     findInnermostByText(isBhimUpiTabText, PAYMENT_TAB_SELECTOR) ||
@@ -357,48 +362,95 @@ function findPaymentTab() {
   );
 }
 
-function findPaytmOption() {
-  return findInnermostByText(isPaytmUpiText, PAYMENT_OPTION_SELECTOR) || probeTextHost("paytm", isPaytmUpiText);
-}
-
-function paymentOptionScope(host) {
-  return host.closest(".bank-box, .col-xs-12, li, label") || host.parentElement || host;
-}
-
-function isPaymentOptionSelected(host) {
-  const scope = paymentOptionScope(host);
-  for (const input of scope.querySelectorAll('input[type="radio"]')) {
-    if (input.checked) return true;
-  }
-  for (const box of scope.querySelectorAll(".p-radiobutton-box, .ui-radiobutton-box")) {
-    if (box.classList.contains("p-radiobutton-checked") || box.classList.contains("ui-state-active")) {
-      return true;
-    }
-  }
-  // IRCTC flags the chosen card by class; keep the walk inside the card so a
-  // parent panel's own "active" class cannot pass for a selection.
-  let node = host;
-  for (let depth = 0; node && depth < 3; depth += 1, node = node.parentElement) {
+function isPaymentTabActive(tab) {
+  let node = tab;
+  for (let i = 0; node && i < 3; i += 1, node = node.parentElement) {
+    if (node.getAttribute && node.getAttribute("aria-selected") === "true") return true;
     for (const cls of node.classList || []) {
-      if (/(^|-)(active|selected|checked)$/i.test(cls)) return true;
+      if (SELECTED_CLASS_RE.test(cls)) return true;
     }
   }
   return false;
 }
 
+let paytmOptionEl = null;
+let paytmProbeAt = 0;
+
+function findPaytmOption() {
+  if (paytmOptionEl && paytmOptionEl.isConnected) return paytmOptionEl;
+  const now = Date.now();
+  // While the tab's XHR is in flight this is asked on every tick; scanning the
+  // whole document faster than this buys nothing.
+  if (now - paytmProbeAt < 250) return null;
+  paytmProbeAt = now;
+  paytmOptionEl =
+    findInnermostByText(isPaytmUpiText, PAYMENT_OPTION_SELECTOR) || probeTextHost("paytm", isPaytmUpiText);
+  return paytmOptionEl;
+}
+
+// The card's radio is sometimes a sibling of the label rather than a child of
+// `.bank-box`, so walk out to the nearest ancestor that holds the radio. Stopping
+// at the first hit matters: with one radio on the page, "largest ancestor" ends
+// at <html> and any `active` class up there would read as a selection.
+function paymentOptionScope(host) {
+  let node = host.parentElement;
+  for (let i = 0; node && node !== document.body && i < 6; i += 1, node = node.parentElement) {
+    const radios = node.querySelectorAll('input[type="radio"]');
+    if (radios.length === 1) return node;
+    if (radios.length > 1) break;
+  }
+  return host.closest(".bank-box, .col-xs-12, li, label") || host.parentElement || host;
+}
+
+function readsAsSelected(el) {
+  if (!el || !el.getAttribute) return false;
+  if (el.checked) return true;
+  if (el.getAttribute("aria-checked") === "true" || el.getAttribute("aria-selected") === "true") return true;
+  for (const cls of el.classList || []) {
+    if (SELECTED_CLASS_RE.test(cls)) return true;
+  }
+  return false;
+}
+
+function isPaymentOptionSelected(host) {
+  const scope = paymentOptionScope(host);
+  if (!scope || scope === document.body || scope === document.documentElement) return false;
+  if (readsAsSelected(scope) || readsAsSelected(host)) return true;
+  for (const el of scope.querySelectorAll("input, [class], [aria-checked], [aria-selected]")) {
+    if (readsAsSelected(el)) return true;
+  }
+  return false;
+}
+
+// Class/aria/checked fingerprint of the card, used to tell whether a tap that
+// exposes no recognizable "selected" flag still changed the page.
+function cardSelectionSignature(scope) {
+  let sig = `${scope.tagName}:${scope.getAttribute("class") || ""}:${scope.getAttribute("aria-checked") || ""};`;
+  for (const el of scope.querySelectorAll("input, [class], [aria-checked], [aria-selected]")) {
+    sig += `${el.tagName}:${el.getAttribute("class") || ""}:${el.getAttribute("aria-checked") || ""}${
+      el.getAttribute("aria-selected") || ""
+    };`;
+  }
+  return sig;
+}
+
 function clickPaymentOption(host, attempt = 0) {
   const scope = paymentOptionScope(host);
   const radio = scope.querySelector('input[type="radio"]');
-  if (radio && !radio.checked) {
+  if (radio) {
+    if (radio.checked) return true;
     radio.click();
     if (radio.checked) return true;
   }
-  // Escalate outwards only if the previous tap did not register: the handler may
-  // sit on the card, its label, or a wrapper above the text.
-  const label = host.closest("label") || scope.querySelector("label");
-  const candidates = [label, host, host.parentElement, scope].filter(Boolean);
-  const target = candidates[Math.min(attempt, candidates.length - 1)];
-  return triggerCTA(target, 0);
+  // One synthetic click only: mousedown/mouseup handlers would fire a second
+  // time, and every extra tap makes IRCTC refetch the PG options, which is the
+  // stall the page shows when the same card is clicked repeatedly.
+  const label = host.closest("label");
+  const targets = [label || scope, scope, host];
+  const target = targets[Math.min(attempt, targets.length - 1)];
+  if (!target || !isVisible(target)) return false;
+  target.click();
+  return true;
 }
 
 let payModeSelectedAt = 0;
@@ -1136,6 +1188,10 @@ let paytmOptionClickedAt = 0;
 let paytmOptionAttempts = 0;
 // Set only after the card actually reads as selected, never by the tap itself.
 let paytmVerifiedAt = 0;
+let paytmBaselineSig = "";
+let paytmOptionSignature = "";
+let paytmOptionSigAt = 0;
+let payTabSeen = false;
 
 function noteRouteChange() {
   const path = window.location.pathname;
@@ -1147,6 +1203,12 @@ function noteRouteChange() {
   paytmOptionClickedAt = 0;
   paytmOptionAttempts = 0;
   paytmVerifiedAt = 0;
+  paytmOptionEl = null;
+  paytmProbeAt = 0;
+  paytmBaselineSig = "";
+  paytmOptionSignature = "";
+  paytmOptionSigAt = 0;
+  payTabSeen = false;
   textHostProbes.clear();
   // Re-entering train-list must start its settle timer over, otherwise the
   // "pick it manually" hints fire on arrival from a stale timestamp.
@@ -1581,44 +1643,78 @@ function runAutomationStep() {
   // STEP 6B: PAYMENT METHODS (bkgPaymentOptions) -> BHIM/UPI -> PAYTM -> PAY & BOOK
   if (window.location.hostname.includes("irctc.co.in") && url.includes("payment")) {
     if (!paymentStageSince) paymentStageSince = Date.now();
+    const stageAge = Date.now() - paymentStageSince;
 
-    // Each stage waits for the one before it: the option list does not exist until
-    // the tab's XHR lands. (The old code rescanned every div on every tick, reading
-    // innerText each time, which forced a reflow per node on this heavy page.)
-    if (
-      !paymentTabClickedAt ||
-      (paytmOptionAttempts === 0 &&
-        paymentTabAttempts < 3 &&
-        Date.now() - paymentTabClickedAt > 4000)
-    ) {
-      const tab = findPaymentTab();
-      if (tab && triggerCTA(tab, 1500)) {
-        paymentTabClickedAt = Date.now();
-        paymentTabAttempts += 1;
-        console.log(`[Tatkal] BHIM/UPI payment tab clicked (attempt ${paymentTabAttempts})`);
-      } else if (!paymentTabClickedAt && Date.now() - paymentStageSince > 6000) {
-        setHudWarning("BHIM/UPI tab not found — select it and Paytm UPI manually");
-      }
-    }
-
-    if (paymentTabClickedAt && !paytmVerifiedAt) {
+    if (!paytmVerifiedAt) {
       const option = findPaytmOption();
+
+      // Only tap the tab when its options are actually missing. IRCTC refetches
+      // the whole mode list on every tab tap, which is what made this page load
+      // slower than the rest of the flow. The short delay also keeps the tap off
+      // nodes Angular is about to replace.
+      if (
+        !option &&
+        stageAge > 400 &&
+        paymentTabAttempts < 2 &&
+        Date.now() - paymentTabClickedAt > 4000
+      ) {
+        const tab = findPaymentTab();
+        if (tab) payTabSeen = true;
+        if (tab && !isPaymentTabActive(tab) && triggerCTA(tab, 1500)) {
+          paymentTabClickedAt = Date.now();
+          paymentTabAttempts += 1;
+          console.log(`[Tatkal] BHIM/UPI payment tab clicked (attempt ${paymentTabAttempts})`);
+        }
+      }
+
       if (option) {
+        const scope = paymentOptionScope(option);
         if (isPaymentOptionSelected(option)) {
           paytmVerifiedAt = Date.now();
           setHudWarning("");
           console.log("[Tatkal] PAYTM UPI selected and verified");
-        } else if (paytmOptionAttempts < 3 && Date.now() - paytmOptionClickedAt > 700) {
-          if (clickPaymentOption(option, paytmOptionAttempts)) {
-            paytmOptionClickedAt = Date.now();
-            paytmOptionAttempts += 1;
-            console.log(`[Tatkal] PAYTM UPI clicked (attempt ${paytmOptionAttempts})`);
+        } else if (paytmOptionClickedAt) {
+          // Some releases swap an icon instead of adding a class, so no flag we
+          // know about ever flips. A class/aria change that survives two reads is
+          // the next best proof that the tap registered.
+          const sig = cardSelectionSignature(scope);
+          if (sig !== paytmOptionSignature) {
+            paytmOptionSignature = sig;
+            paytmOptionSigAt = Date.now();
+          } else if (
+            paytmOptionSignature !== paytmBaselineSig &&
+            Date.now() - paytmOptionSigAt > 400
+          ) {
+            paytmVerifiedAt = Date.now();
+            setHudWarning("");
+            console.log("[Tatkal] PAYTM UPI selection confirmed by page update");
           }
-        } else if (paytmOptionAttempts >= 3 && Date.now() - paytmOptionClickedAt > 1200) {
-          setHudWarning("Paytm UPI did not register — tap it, then Pay & Book");
         }
-      } else if (Date.now() - paymentStageSince > 6000) {
-        setHudWarning("Payment options did not load — pick the UPI option manually");
+
+        if (!paytmVerifiedAt) {
+          // One retry only: if the first tap registered, extra taps make IRCTC
+          // refetch the PG options and the page stalls for no gain.
+          if (paytmOptionAttempts < 2 && Date.now() - paytmOptionClickedAt > 1200) {
+            if (!paytmBaselineSig) {
+              paytmBaselineSig = cardSelectionSignature(scope);
+              paytmOptionSignature = paytmBaselineSig;
+              paytmOptionSigAt = Date.now();
+            }
+            if (clickPaymentOption(option, paytmOptionAttempts)) {
+              paytmOptionClickedAt = Date.now();
+              paytmOptionAttempts += 1;
+              console.log(`[Tatkal] PAYTM UPI clicked (attempt ${paytmOptionAttempts})`);
+            }
+          } else if (paytmOptionAttempts >= 2 && Date.now() - paytmOptionClickedAt > 1200) {
+            setHudWarning("Paytm UPI did not register — tap it, then Pay & Book");
+          }
+        }
+      } else if (stageAge > 6000) {
+        setHudWarning(
+          payTabSeen
+            ? "Payment options did not load — pick the UPI option manually"
+            : "BHIM/UPI tab not found — select it and Paytm UPI manually"
+        );
       }
     }
 
@@ -1629,7 +1725,9 @@ function runAutomationStep() {
         findVisibleButtonByText("Pay & Book") ||
         document.querySelector("button.btn-primary:not([disabled])");
       if (payAndBookBtn && !payAndBookBtn.disabled) {
-        clickSubmitOnce(payAndBookBtn, "Pay & Book");
+        // Never re-click Pay & Book: a second attempt while the PG page is
+        // opening is a second payment request, not a retry.
+        clickSubmitOnce(payAndBookBtn, "Pay & Book", 1);
       }
     }
   }
