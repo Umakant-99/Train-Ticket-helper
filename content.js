@@ -39,27 +39,61 @@ const MAX_SUBMIT_ATTEMPTS = 2;
 
 let submitState = { pathname: "", timestamp: 0, count: 0 };
 
-function isSubmissionInFlight() {
-  const busy = document.querySelectorAll(
-    "p-blockui, .p-blockui, .ui-blockui, .block-ui, .blockUI, .loading-wrapper, .spinner-border, #divLoader, .please-wait"
-  );
-  if (Array.from(busy).some(isVisible)) return true;
+const BUSY_OVERLAY_SELECTOR = [
+  "p-blockui",
+  ".p-blockui",
+  ".ui-blockui",
+  ".block-ui",
+  ".block-ui-active",
+  ".blockUI",
+  ".loading-wrapper",
+  ".spinner-border",
+  "#divLoader",
+  ".please-wait",
+  "[class*='block-ui']",
+  "[class*='please-wait']",
+].join(", ");
 
-  // IRCTC's "Please Wait..." overlay is just a small centered card with that text.
-  const candidates = document.querySelectorAll("div, span, p");
-  for (const el of candidates) {
-    if (el.children.length > 1) continue;
-    const txt = (el.textContent || "").trim();
-    if (txt.length > 24 || !/please\s*wait/i.test(txt)) continue;
+let pleaseWaitProbedAt = 0;
+let pleaseWaitFound = false;
 
-    const style = window.getComputedStyle(el);
+// IRCTC's "Please Wait..." overlay is sometimes a bare centered card with no
+// recognizable class. Walking every div/span/p for its text on each 250ms tick
+// was the most expensive thing this script did on psgninput, so the walk is
+// bounded and its result is reused for a quarter second.
+function probePleaseWaitText() {
+  const now = Date.now();
+  if (now - pleaseWaitProbedAt < 250) return pleaseWaitFound;
+  pleaseWaitProbedAt = now;
+  pleaseWaitFound = false;
+
+  const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+  let visited = 0;
+  let node;
+  while ((node = walker.nextNode()) && visited < 6000) {
+    visited += 1;
+    const txt = node.nodeValue;
+    if (!txt || txt.length > 24 || !/please\s*wait/i.test(txt)) continue;
+
+    const host = node.parentElement;
+    if (!host) continue;
+    const style = window.getComputedStyle(host);
     if (style.visibility === "hidden" || parseFloat(style.opacity) < 0.5) continue;
-    const rect = el.getBoundingClientRect();
+    const rect = host.getBoundingClientRect();
     if (rect.width < 40 || rect.height < 10) continue;
     if (rect.bottom < 0 || rect.top > window.innerHeight) continue;
-    return true;
+
+    pleaseWaitFound = true;
+    break;
   }
-  return false;
+  return pleaseWaitFound;
+}
+
+function isSubmissionInFlight() {
+  for (const el of document.querySelectorAll(BUSY_OVERLAY_SELECTOR)) {
+    if (isVisible(el)) return true;
+  }
+  return probePleaseWaitText();
 }
 
 let overlaySince = 0;
@@ -131,6 +165,21 @@ function findVisibleButtonByText(labelText) {
     if (txt === target || txt.includes(target)) {
       return btn;
     }
+  }
+  return null;
+}
+
+function normalizeInline(text) {
+  return (text || "").replace(/\s+/g, " ").trim().toUpperCase();
+}
+
+// Reads text before layout: textContent never forces a reflow, so a broad
+// selector only pays for getBoundingClientRect on the elements that match.
+function findClickableByText(matcher, selector) {
+  for (const el of document.querySelectorAll(selector)) {
+    const txt = normalizeInline(el.textContent);
+    if (!txt || !matcher(txt)) continue;
+    if (isVisible(el)) return el;
   }
   return null;
 }
@@ -211,6 +260,22 @@ function selectBhimUpiPaymentMode() {
   return { found: true, selected: isRadioChecked(found.input) };
 }
 
+// Payment-options page selectors. `div` is deliberately absent: matching every
+// div (as the old scan did) makes reading text a layout pass per element.
+const PAYMENT_TAB_SELECTOR =
+  "[class*='bank-type'], .nav-tabs li, .nav-tabs a, li[role='tab'], [role='tab'], li, a, span";
+const PAYMENT_OPTION_SELECTOR = "div.bank-text, .bank-box, .col-xs-12, label, li, span";
+
+function isBhimUpiTabText(t) {
+  return (
+    t.length <= 30 &&
+    t.startsWith("BHIM") &&
+    t.includes("UPI") &&
+    !t.includes("CREDIT") &&
+    !t.includes("WALLET")
+  );
+}
+
 let payModeSelectedAt = 0;
 
 function trackPayModeSelection() {
@@ -227,22 +292,25 @@ function trackPayModeSelection() {
 // ============================================================================
 // STEP 0: CONTINUOUSLY DISMISS WELCOME / ENGLISH / ALERT POPUPS
 // ============================================================================
+const DIALOG_BUTTON_SELECTOR =
+  "p-confirmdialog button, p-dialog button, app-confirmdialog button, .ui-dialog button, .p-dialog button, .modal-dialog button";
+
 function handleWelcomeLanguagePopup() {
-  const dialogButtons = document.querySelectorAll(
-    "p-dialog button, app-confirmdialog button, .ui-dialog button, .p-dialog button, .modal-dialog button, button"
-  );
+  // Inside the booking/payment flow the page holds hundreds of buttons, and the
+  // old catch-all `button` selector forced a layout read on every one of them on
+  // each poll. Dialogs are all this handler needs there.
+  const inFlow = /booking\/|payment\//.test(window.location.pathname);
+  const buttons = document.querySelectorAll(inFlow ? DIALOG_BUTTON_SELECTOR : `${DIALOG_BUTTON_SELECTOR}, button`);
 
-  dialogButtons.forEach((btn) => {
-    if (!isVisible(btn)) return;
-    const text = (btn.innerText || btn.textContent || "").trim();
-
-    if (text === "English" || text === "ENGLISH") {
-      triggerCTA(btn, 400);
-    }
-    if ((text === "OK" || text === "Ok") && !window.location.href.includes("train-list")) {
-      triggerCTA(btn, 400);
-    }
-  });
+  for (const btn of buttons) {
+    const text = (btn.textContent || "").trim();
+    const isEnglish = text === "English" || text === "ENGLISH";
+    const isOk = text === "OK" || text === "Ok";
+    if (!isEnglish && !isOk) continue;
+    if (isOk && window.location.href.includes("train-list")) continue;
+    if (!isVisible(btn)) continue;
+    triggerCTA(btn, 400);
+  }
 }
 
 handleWelcomeLanguagePopup();
@@ -848,7 +916,7 @@ function fillPrimeNGDropdown(dropdownSelector, targetText) {
   return false;
 }
 
-function focusCaptcha(captchaInput, submitBtn) {
+function focusCaptcha(captchaInput, submitBtn, submitLabel = "Continue") {
   if (!captchaInput || !isVisible(captchaInput)) return;
   if (document.activeElement !== captchaInput && captchaInput.dataset.focused !== "true") {
     captchaInput.dataset.focused = "true";
@@ -858,9 +926,17 @@ function focusCaptcha(captchaInput, submitBtn) {
     captchaInput.style.backgroundColor = "#fff8e1";
 
     captchaInput.addEventListener("keydown", (e) => {
-      if (e.key === "Enter") {
-        e.preventDefault();
-        if (submitBtn) submitBtn.click();
+      if (e.key !== "Enter") return;
+      e.preventDefault();
+      // Angular re-renders the page (and the button) while the captcha is being
+      // typed, so the reference captured at focus time is usually detached.
+      const fresh =
+        submitBtn && submitBtn.isConnected && !submitBtn.disabled && isVisible(submitBtn)
+          ? submitBtn
+          : findVisibleButtonByText(submitLabel);
+      if (fresh && !fresh.disabled) {
+        fresh.click();
+        console.log(`[Tatkal] "${submitLabel}" clicked from captcha Enter on ${window.location.pathname}`);
       }
     });
   }
@@ -920,14 +996,56 @@ let timerUnlocked = true;
 // The date the search actually ran with, so later steps never fall back to a
 // different day than the train list was fetched for.
 let resolvedJourneyDate = null;
+let trainListSince = 0;
+let trainRetryKey = "";
+let trainRetryCount = 0;
+let trainRetryAt = 0;
+
+// Route-scoped one-shot actions. Module state (not element datasets) survives
+// Angular re-renders, so the payment tab cannot be re-clicked on every tick.
+let activePath = "";
+let paymentTabClickedAt = 0;
+let paymentTabAttempts = 0;
+let paytmOptionClickedAt = 0;
+let paytmOptionAttempts = 0;
+
+function noteRouteChange() {
+  const path = window.location.pathname;
+  if (path === activePath) return false;
+  activePath = path;
+  paymentTabClickedAt = 0;
+  paymentTabAttempts = 0;
+  paytmOptionClickedAt = 0;
+  paytmOptionAttempts = 0;
+  console.log(
+    `[Tatkal][route] ${path} @ ${new Date().toTimeString().split(" ")[0]}.${String(
+      Date.now() % 1000
+    ).padStart(3, "0")}`
+  );
+  return true;
+}
+
+let loggedInProbedAt = 0;
+let loggedInProbedValue = false;
 
 function isUserLoggedIn() {
+  // Reading body.innerText forces a full layout pass; the header state does not
+  // change between polls, so one probe per second is plenty.
+  const now = Date.now();
+  if (now - loggedInProbedAt < 800) return loggedInProbedValue;
+  loggedInProbedAt = now;
+
   const loginHeaderBtn = document.querySelector("a.loginText, button.search_btn.loginText");
-  if (loginHeaderBtn && isVisible(loginHeaderBtn) && (loginHeaderBtn.innerText || "").trim().toUpperCase() === "LOGIN") {
+  if (loginHeaderBtn && isVisible(loginHeaderBtn) && (loginHeaderBtn.textContent || "").trim().toUpperCase() === "LOGIN") {
+    loggedInProbedValue = false;
     return false;
   }
-  const pageText = (document.querySelector("app-header")?.innerText || document.body.innerText || "").toUpperCase();
-  return pageText.includes("WELCOME ") || pageText.includes("LOGOUT") || pageText.includes("MY ACCOUNT");
+  // Prefer the header: body textContent also carries every inline <script>.
+  const header = document.querySelector("app-header, header, .header");
+  const pageText = (header ? header.textContent : document.body.innerText || "").toUpperCase();
+  loggedInProbedValue =
+    pageText.includes("WELCOME ") || pageText.includes("LOGOUT") || pageText.includes("MY ACCOUNT");
+  return loggedInProbedValue;
 }
 
 function handleLoginModal() {
@@ -951,7 +1069,7 @@ function handleLoginModal() {
   );
 
   if (isVisible(loginCaptcha)) {
-    focusCaptcha(loginCaptcha, signInBtn);
+    focusCaptcha(loginCaptcha, signInBtn, "SIGN IN");
   } else if (uFilled && pFilled && signInBtn) {
     triggerCTA(signInBtn, 1500);
   }
@@ -1048,7 +1166,90 @@ function handleBookTicketSearchForm() {
   }
 }
 
+// ---- train-list: pick the class / date cell -------------------------------
+const TRAIN_CLICK_RETRY_MS = 6000;
+const MAX_TRAIN_CLICK_RETRIES = 2;
+
+function escapeRegExp(text) {
+  return String(text).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+// IRCTC labels a class cell "3A", "3A TATKAL" or "3A\nAVAILABLE 12" depending on
+// quota (and sometimes puts the code in its own header cell), so match the code
+// as a standalone token instead of a fixed prefix.
+function classTokenPattern(coachClass) {
+  const code = (coachClass || "").trim().toUpperCase();
+  return code ? new RegExp(`(^|[^A-Z0-9])${escapeRegExp(code)}([^A-Z0-9]|$)`) : null;
+}
+
+function getTrainContainers() {
+  const holders = Array.from(document.querySelectorAll("app-train-avl-enq"));
+  if (holders.length) return holders;
+  return Array.from(document.querySelectorAll(".train-heading"))
+    .map((heading) => heading.closest(".tbis-div") || heading.parentElement)
+    .filter(Boolean);
+}
+
+function findTrainClassCell(train, coachClass) {
+  const pattern = classTokenPattern(coachClass);
+  if (!pattern) return null;
+  const leaves = Array.from(
+    train.querySelectorAll("div.pre-avl, td, th, li, .avl-classes, a, span, strong, label")
+  ).filter((el) => isVisible(el) && !el.querySelector("div.pre-avl, td, li, table"));
+  for (const el of leaves) {
+    const txt = (el.innerText || "").trim().toUpperCase();
+    if (!txt || !pattern.test(txt)) continue;
+    return el.closest("td div.pre-avl, .avl-classes li, td, li, a") || el;
+  }
+  return null;
+}
+
+function findAvailabilityCell(train, parsedJourney, dayPattern, coachClass) {
+  const isAvailable = (el) => {
+    const txt = (el.innerText || "").toUpperCase();
+    return (
+      txt.includes("AVAILABLE") || txt.includes("WL") || txt.includes("RAC") || txt.includes("CURR_AVBL")
+    );
+  };
+  const all = Array.from(
+    train.querySelectorAll("td div.pre-avl, li.ui-state-default")
+  ).filter((el) => isVisible(el) && isAvailable(el));
+  if (!all.length) return null;
+
+  // When the class code sits inside the availability cell, clicking a cell from
+  // another class would switch the selection back, so prefer the wanted class.
+  const pattern = classTokenPattern(coachClass);
+  const classCells = pattern
+    ? all.filter((el) => pattern.test((el.innerText || "").toUpperCase()))
+    : [];
+  const pool = classCells.length ? classCells : all;
+
+  const targetPrefix = getIrctcCardDatePrefix(parsedJourney);
+  if (targetPrefix) {
+    const exact = pool.find((el) =>
+      (el.innerText || "").toUpperCase().includes(targetPrefix.toUpperCase())
+    );
+    if (exact) return exact;
+  }
+  if (dayPattern) {
+    const dayHit = pool.find((el) => dayPattern.test(el.innerText || ""));
+    if (dayHit) return dayHit;
+  }
+  return pool[0];
+}
+
+function noteTrainRetry(key) {
+  if (trainRetryKey === key) return;
+  trainRetryKey = key;
+  trainRetryCount = 0;
+  trainRetryAt = 0;
+}
+
+let lastStepAt = 0;
+
 function runAutomationStep() {
+  lastStepAt = Date.now();
+  noteRouteChange();
   handleWelcomeLanguagePopup();
 
   if (!config.username && !config.trainNo && !config.fromStn) return;
@@ -1075,66 +1276,77 @@ function runAutomationStep() {
   }
 
   // STEP 4: SELECT TRAIN, CLASS, DATE CARD & CLICK "BOOK NOW" CTA ON train-list
-  if (timerUnlocked && config.trainNo && url.includes("booking/train-list")) {
+  if (timerUnlocked && url.includes("booking/train-list")) {
+    if (!trainListSince) trainListSince = Date.now();
+
+    if (!config.trainNo) {
+      setHudWarning("Enter the train number in the popup so the train can be picked");
+      return;
+    }
+
     const parsedJourney = getEffectiveJourneyDate() || resolvedJourneyDate;
-    const targetCardDate = getIrctcCardDatePrefix(parsedJourney);
     const dayPattern = parsedJourney ? new RegExp(`(^|[^0-9])0?${parsedJourney.day}([^0-9]|$)`) : null;
-    const trainHolders = document.querySelectorAll("app-train-avl-enq");
+    const containers = getTrainContainers();
 
-    trainHolders.forEach((train) => {
-      const heading = train.querySelector(".train-heading");
-      if (heading && heading.innerText.includes(config.trainNo)) {
-        const classBoxes = train.querySelectorAll("td div.pre-avl, li.ui-state-default, .avl-classes");
-        classBoxes.forEach((box) => {
-          const boxText = box.innerText.trim();
-          if (
-            boxText.includes(`(${config.coachClass})`) ||
-            boxText.startsWith(`${config.coachClass}\n`) ||
-            boxText === config.coachClass
-          ) {
-            if (!box.dataset.classClicked) {
-              box.dataset.classClicked = "true";
-              box.click();
-            }
-          }
-        });
+    noteTrainRetry(`${config.trainNo}|${config.coachClass}|${config.quota}`);
 
-        const dayCards = train.querySelectorAll("td div.pre-avl");
-        let matchedDateCard = null;
+    let matchedTrain = false;
+    let classCell = null;
+    let bookReady = false;
 
-        dayCards.forEach((card) => {
-          const txt = card.innerText;
-          const isDateSlot =
-            txt.includes("AVAILABLE") || txt.includes("WL") || txt.includes("RAC") || txt.includes("CURR_AVBL");
-          if (isDateSlot) {
-            if (targetCardDate && txt.includes(targetCardDate)) {
-              matchedDateCard = card;
-            } else if (!matchedDateCard && dayPattern && dayPattern.test(txt)) {
-              matchedDateCard = card;
-            }
-          }
-        });
+    containers.forEach((train) => {
+      const heading = train.querySelector(".train-heading") || train;
+      if (!heading.innerText.includes(config.trainNo)) return;
+      matchedTrain = true;
 
-        if (!matchedDateCard) {
-          dayCards.forEach((card) => {
-            const txt = card.innerText;
-            if (!matchedDateCard && (txt.includes("AVAILABLE") || txt.includes("RAC") || txt.includes("WL"))) {
-              matchedDateCard = card;
-            }
-          });
-        }
+      classCell = findTrainClassCell(train, config.coachClass);
+      const dateCell = findAvailabilityCell(train, parsedJourney, dayPattern, config.coachClass);
 
-        if (matchedDateCard && !matchedDateCard.dataset.dayClicked) {
-          matchedDateCard.dataset.dayClicked = "true";
-          matchedDateCard.click();
-        }
+      if (classCell && !classCell.dataset.classClicked) {
+        classCell.dataset.classClicked = "true";
+        classCell.click();
+      }
 
-        const bookBtn = train.querySelector('button.btnDefault.train_Search:not([disabled])');
-        if (bookBtn && bookBtn.innerText.toUpperCase().includes("BOOK NOW")) {
-          triggerCTA(bookBtn, 1200);
-        }
+      if (dateCell && !dateCell.dataset.dayClicked) {
+        dateCell.dataset.dayClicked = "true";
+        dateCell.click();
+      }
+
+      const bookBtn = train.querySelector('button.btnDefault.train_Search:not([disabled])');
+      if (bookBtn && bookBtn.innerText.toUpperCase().includes("BOOK NOW")) {
+        bookReady = true;
+        triggerCTA(bookBtn, 1200);
       }
     });
+
+    // A click can land before IRCTC finishes rendering the availability grid, so
+    // retry the same cells a couple of times before asking for manual input.
+    if (matchedTrain && !bookReady && trainRetryCount < MAX_TRAIN_CLICK_RETRIES) {
+      if (!trainRetryAt) {
+        trainRetryAt = Date.now() + TRAIN_CLICK_RETRY_MS;
+      } else if (Date.now() >= trainRetryAt) {
+        trainRetryCount += 1;
+        trainRetryAt = Date.now() + TRAIN_CLICK_RETRY_MS;
+        const retryTrain = containers.find((c) =>
+          ((c.querySelector(".train-heading") || c).innerText || "").includes(config.trainNo)
+        );
+        if (retryTrain) {
+          (findTrainClassCell(retryTrain, config.coachClass) || classCell)?.click();
+          findAvailabilityCell(retryTrain, parsedJourney, dayPattern, config.coachClass)?.click();
+        }
+      }
+    }
+
+    const settled = Date.now() - trainListSince > 5000;
+    if (bookReady) {
+      setHudWarning("");
+    } else if (settled && !matchedTrain) {
+      setHudWarning(`Train ${config.trainNo} not found in this list — pick it manually`);
+    } else if (settled && !classCell) {
+      setHudWarning(`Class ${config.coachClass} not on this train's list — select it manually`);
+    } else if (settled && trainRetryCount >= MAX_TRAIN_CLICK_RETRIES) {
+      setHudWarning(`Tap the ${config.coachClass} cell and date, then Book Now`);
+    }
 
     const confirmYesBtn = document.querySelector(
       "p-confirmdialog button.ui-confirmdialog-acceptbutton, .ui-dialog-footer button.btn-primary"
@@ -1230,42 +1442,100 @@ function runAutomationStep() {
   }
 
   // STEP 6B: PAYMENT METHODS (bkgPaymentOptions) -> BHIM/UPI -> PAYTM -> PAY & BOOK
-  if (url.includes("payment/bkgPaymentOptions") || url.includes("payment")) {
-    const allDivs = document.querySelectorAll("div.bank-type, li, span, div");
-    allDivs.forEach((tab) => {
-      if (!isVisible(tab)) return;
-      const txt = (tab.innerText || "").trim().toUpperCase();
-      if (txt === "BHIM/ UPI/ USSD" && !tab.dataset.upiTabClicked) {
-        tab.dataset.upiTabClicked = "true";
-        tab.click();
+  if (window.location.hostname.includes("irctc.co.in") && url.includes("payment")) {
+    // Each stage waits for the one before it: the option list does not exist until
+    // the tab's XHR lands. (The old code rescanned every div on every tick, reading
+    // innerText each time, which forced a reflow per node on this heavy page.)
+    if (!paymentTabClickedAt || (paytmOptionAttempts === 0 && Date.now() - paymentTabClickedAt > 4000)) {
+      const tab = findClickableByText(isBhimUpiTabText, PAYMENT_TAB_SELECTOR);
+      const tabTarget = tab ? tab.querySelector("a, span") || tab : null;
+      if (tabTarget && triggerCTA(tabTarget, 1500)) {
+        paymentTabClickedAt = Date.now();
+        paymentTabAttempts += 1;
+        console.log(`[Tatkal] BHIM/UPI payment tab clicked (attempt ${paymentTabAttempts})`);
       }
-    });
+    }
 
-    const payBoxes = document.querySelectorAll("div.bank-text, .bank-box, .col-xs-12, span");
-    let paytmSelected = false;
-    payBoxes.forEach((opt) => {
-      if (!isVisible(opt)) return;
-      const txt = (opt.innerText || "").trim().toUpperCase();
-      if (txt.startsWith("PAYTM UPI")) {
-        const clickableBox = opt.closest(".bank-box, .col-xs-12") || opt;
-        if (!clickableBox.dataset.paytmClicked) {
-          clickableBox.dataset.paytmClicked = "true";
-          clickableBox.click();
+    if (paymentTabClickedAt && !paytmOptionClickedAt) {
+      const option = findClickableByText((t) => t.startsWith("PAYTM UPI"), PAYMENT_OPTION_SELECTOR);
+      if (option) {
+        const clickableBox = option.closest(".bank-box, .col-xs-12, .bank-text") || option;
+        if (triggerCTA(clickableBox, 1200)) {
+          paytmOptionClickedAt = Date.now();
+          paytmOptionAttempts += 1;
+          setHudWarning("");
+          console.log("[Tatkal] PAYTM UPI selected");
         }
-        paytmSelected = true;
       }
-    });
+    } else if (paytmOptionClickedAt && Date.now() - paytmOptionClickedAt > 4000) {
+      // The option click can land before Angular binds it; retry once instead of
+      // sitting on a disabled Pay & Book button.
+      const payBtn = findVisibleButtonByText("Pay & Book");
+      if ((!payBtn || payBtn.disabled) && paytmOptionAttempts < 2) {
+        paytmOptionClickedAt = 0;
+      }
+    }
 
-    if (paytmSelected) {
+    if (paytmOptionClickedAt) {
       const payAndBookBtn =
         findVisibleButtonByText("Pay & Book") ||
         document.querySelector("button.btn-primary:not([disabled])");
-      if (payAndBookBtn) {
+      if (payAndBookBtn && !payAndBookBtn.disabled) {
         clickSubmitOnce(payAndBookBtn, "Pay & Book");
       }
+    } else if (paymentTabClickedAt && Date.now() - paymentTabClickedAt > 5000) {
+      setHudWarning("Payment options did not load — pick the UPI option manually");
     }
   }
 }
+
+// ============================================================================
+// INSTANT ROUTE REACTION
+// The 250ms poll still drives the clock, but IRCTC's Angular routes render at
+// arbitrary moments. Watching the DOM lets the next step run as soon as the new
+// page's content appears instead of waiting for the next tick.
+// ============================================================================
+const WATCHED_ROUTE = /booking\/(psgninput|reviewBooking)|payment\//;
+const STEP_THROTTLE_MS = 80;
+let stepScheduled = false;
+
+function scheduleStep() {
+  if (stepScheduled) return;
+  stepScheduled = true;
+  requestAnimationFrame(() => {
+    const wait = STEP_THROTTLE_MS - (Date.now() - lastStepAt);
+    if (wait > 0) {
+      // Re-arm instead of dropping the run, otherwise a burst of mutations right
+      // after a step makes the user wait for the next 250ms poll.
+      setTimeout(() => {
+        stepScheduled = false;
+        scheduleStep();
+      }, wait);
+      return;
+    }
+    stepScheduled = false;
+    runAutomationStep();
+  });
+}
+
+function startDomWatcher() {
+  if (!document.body) {
+    document.addEventListener("DOMContentLoaded", startDomWatcher, { once: true });
+    return;
+  }
+  const observer = new MutationObserver((records) => {
+    if (!WATCHED_ROUTE.test(window.location.pathname)) return;
+    for (const record of records) {
+      const node = record.target.nodeType === 1 ? record.target : record.target.parentElement;
+      if (node && node.closest && node.closest("#tatkal-hud")) continue;
+      scheduleStep();
+      return;
+    }
+  });
+  observer.observe(document.body, { childList: true, subtree: true });
+}
+
+startDomWatcher();
 
 function resetEngineState() {
   isFillingStation = false;
@@ -1273,6 +1543,10 @@ function resetEngineState() {
   datePanelTargetText = "";
   datePickerStepAt = 0;
   resolvedJourneyDate = null;
+  trainListSince = 0;
+  trainRetryKey = "";
+  trainRetryCount = 0;
+  trainRetryAt = 0;
 }
 
 let lastInitAt = 0;
