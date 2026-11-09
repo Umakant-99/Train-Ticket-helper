@@ -61,13 +61,38 @@ let pleaseWaitFound = false;
 // recognizable class. Walking every div/span/p for its text on each 250ms tick
 // was the most expensive thing this script did on psgninput, so the walk is
 // bounded and its result is reused for a quarter second.
+function isPleaseWaitHostVisible(host) {
+  const style = window.getComputedStyle(host);
+  if (style.visibility === "hidden" || parseFloat(style.opacity) < 0.5) return false;
+  const rect = host.getBoundingClientRect();
+  if (rect.width < 40 || rect.height < 10) return false;
+  return !(rect.bottom < 0 || rect.top > window.innerHeight);
+}
+
 function probePleaseWaitText() {
   const now = Date.now();
   if (now - pleaseWaitProbedAt < 250) return pleaseWaitFound;
   pleaseWaitProbedAt = now;
   pleaseWaitFound = false;
 
-  const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+  const body = document.body;
+  if (!body) return false;
+
+  // IRCTC mounts the overlay as the last children of <body>, so check that tail
+  // first: the bounded walk below can run out of budget on a busy page before
+  // reaching a card that was appended at the very end.
+  const children = body.children;
+  for (let i = children.length - 1, checked = 0; i >= 0 && checked < 40; i -= 1, checked += 1) {
+    const el = children[i];
+    const txt = el.textContent;
+    if (!txt || txt.length > 4000 || !/please\s*wait/i.test(txt)) continue;
+    if (isPleaseWaitHostVisible(el)) {
+      pleaseWaitFound = true;
+      return true;
+    }
+  }
+
+  const walker = document.createTreeWalker(body, NodeFilter.SHOW_TEXT);
   let visited = 0;
   let node;
   while ((node = walker.nextNode()) && visited < 6000) {
@@ -76,12 +101,7 @@ function probePleaseWaitText() {
     if (!txt || txt.length > 24 || !/please\s*wait/i.test(txt)) continue;
 
     const host = node.parentElement;
-    if (!host) continue;
-    const style = window.getComputedStyle(host);
-    if (style.visibility === "hidden" || parseFloat(style.opacity) < 0.5) continue;
-    const rect = host.getBoundingClientRect();
-    if (rect.width < 40 || rect.height < 10) continue;
-    if (rect.bottom < 0 || rect.top > window.innerHeight) continue;
+    if (!host || !isPleaseWaitHostVisible(host)) continue;
 
     pleaseWaitFound = true;
     break;
@@ -1017,6 +1037,12 @@ function noteRouteChange() {
   paymentTabAttempts = 0;
   paytmOptionClickedAt = 0;
   paytmOptionAttempts = 0;
+  // Re-entering train-list must start its settle timer over, otherwise the
+  // "pick it manually" hints fire on arrival from a stale timestamp.
+  trainListSince = 0;
+  trainRetryKey = "";
+  trainRetryCount = 0;
+  trainRetryAt = 0;
   console.log(
     `[Tatkal][route] ${path} @ ${new Date().toTimeString().split(" ")[0]}.${String(
       Date.now() % 1000
