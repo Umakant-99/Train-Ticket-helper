@@ -548,10 +548,17 @@ function collapseText(text) {
 
 // PrimeNG dropdowns keep the picked option in a label element, not in a value
 // property, so this is the only text that reflects what the passenger row shows.
+// Editable dropdowns render that label as an <input>, whose value is not text.
 function controlLabelText(host) {
   if (!host) return "";
   const labelEl = host.querySelector(".p-dropdown-label, .ui-dropdown-label, .p-select-label");
-  return collapseText(labelEl ? labelEl.textContent : host.textContent).toUpperCase();
+  if (labelEl) {
+    const text = labelEl.tagName === "INPUT" ? labelEl.value : labelEl.textContent;
+    return collapseText(text).toUpperCase();
+  }
+  const input = host.querySelector("input[type='text'], input:not([type])");
+  if (input && input.value) return collapseText(input.value).toUpperCase();
+  return collapseText(host.textContent).toUpperCase();
 }
 
 function labelMatchesTarget(label, target, aliases) {
@@ -565,8 +572,22 @@ function labelMatchesTarget(label, target, aliases) {
 
 function clickLikeUser(el) {
   if (!el) return false;
-  el.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true }));
-  el.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, cancelable: true }));
+  const rect = el.getBoundingClientRect();
+  const base = {
+    bubbles: true,
+    cancelable: true,
+    view: window,
+    clientX: rect.left + rect.width / 2,
+    clientY: rect.top + rect.height / 2,
+  };
+  const pointer = (type) => {
+    if (typeof PointerEvent !== "function") return;
+    el.dispatchEvent(new PointerEvent(type, { ...base, pointerId: 1, isPrimary: true, button: 0 }));
+  };
+  pointer("pointerdown");
+  el.dispatchEvent(new MouseEvent("mousedown", base));
+  pointer("pointerup");
+  el.dispatchEvent(new MouseEvent("mouseup", base));
   el.click();
   return true;
 }
@@ -609,67 +630,145 @@ function selectIsSettled(element, value, aliases) {
   return selectState(element, value, aliases) === "settled";
 }
 
-// PrimeNG renders some dropdowns as a div with no value to assign, so the list
-// has to be opened and the matching item clicked. The overlay is normally
-// appended to <body>, but a global query would hit another row's list first and
-// flip that passenger's value, so prefer the panel this host points at, then the
-// items inside the host, and only then the last visible panel.
-function dropdownItems(host) {
-  const own = host.querySelectorAll(
-    ".p-dropdown-items li, .ui-dropdown-items li, p-dropdownitem li, .p-select-items li, [role='option']"
-  );
-  if (own.length) return Array.from(own);
+const DROPDOWN_ROOT_SELECTOR = "p-dropdown, p-select, .p-dropdown, .ui-dropdown, .p-select";
+const DROPDOWN_PANEL_SELECTOR =
+  ".p-dropdown-panel, .ui-dropdown-panel, .p-select-panel, .p-select-overlay, .p-overlay-panel, [role='listbox']";
 
-  const anchors = [host, ...host.querySelectorAll("[aria-controls], [aria-owns]")];
-  for (const anchor of anchors) {
-    const ref = anchor.getAttribute && (anchor.getAttribute("aria-controls") || anchor.getAttribute("aria-owns"));
-    if (!ref) continue;
-    const panel = document.getElementById(ref.split(" ")[0]);
-    if (!panel) continue;
-    const items = panel.querySelectorAll("[role='option'], li");
-    if (items.length) return Array.from(items);
+function dropdownContainer(host) {
+  if (!host) return null;
+  if (host.matches && host.matches(DROPDOWN_ROOT_SELECTOR)) {
+    return host.querySelector(".p-dropdown, .ui-dropdown, .p-select") || host;
   }
+  return host.querySelector(".p-dropdown, .ui-dropdown, .p-select") || host;
+}
 
-  const panels = Array.from(
-    document.querySelectorAll(
-      ".p-dropdown-panel, .ui-dropdown-panel, .p-select-panel, .p-select-overlay, [role='listbox']"
-    )
+function visibleDropdownPanels() {
+  return Array.from(document.querySelectorAll(DROPDOWN_PANEL_SELECTOR)).filter(isVisible);
+}
+
+function panelOptionItems(panel) {
+  const all = Array.from(
+    panel.querySelectorAll("[role='option'], .p-dropdown-item, .p-select-option, li")
   );
-  for (let i = panels.length - 1; i >= 0; i -= 1) {
-    if (!isVisible(panels[i])) continue;
-    const items = panels[i].querySelectorAll("li, [role='option']");
-    if (items.length) return Array.from(items);
+  return all.filter((el) => !el.querySelector("[role='option'], .p-dropdown-item, .p-select-option"));
+}
+
+// Options seen once are remembered by text, so a panel that closed again can
+// still be driven with the control's own keyboard handler.
+const dropdownItemCache = new WeakMap();
+
+// PrimeNG renders some dropdowns as a div with no value to assign, so the list
+// has to be opened and the matching item clicked. The overlay is usually
+// appended to <body>; a global query would hit the other row's panel — or the
+// berth panel left in the DOM — and flip the wrong field. Prefer this host's own
+// panel, then the panel this host points at, then the visible panel that
+// actually lists the wanted option.
+function dropdownItems(host, target, aliases) {
+  const own = panelOptionItems(host).filter(isVisible);
+  if (own.length) return own;
+
+  const linked = [];
+  for (const anchor of [host, ...host.querySelectorAll("[aria-controls], [aria-owns]")]) {
+    const ref =
+      anchor.getAttribute && (anchor.getAttribute("aria-controls") || anchor.getAttribute("aria-owns"));
+    if (!ref) continue;
+    for (const id of String(ref).split(/\s+/)) {
+      const panel = document.getElementById(id);
+      if (panel) linked.push(...panelOptionItems(panel));
+    }
+  }
+  if (linked.length) return linked;
+
+  const panels = visibleDropdownPanels();
+  // Panels that were already on screen when this host was tapped belong to other
+  // fields (or a stale tap); the panel this tap opened is the one to use.
+  const before = host.__tatkalPanelsBefore || [];
+  const fresh = panels.filter((panel) => !before.includes(panel));
+  const preferred = fresh.length ? fresh : panels;
+  if (target) {
+    const matching = preferred.filter((panel) =>
+      panelOptionItems(panel).some((item) => labelMatchesTarget(item.textContent, target, aliases))
+    );
+    if (matching.length) return panelOptionItems(matching[matching.length - 1]);
+  }
+  for (let i = preferred.length - 1; i >= 0; i -= 1) {
+    const items = panelOptionItems(preferred[i]);
+    if (items.length) return items;
   }
   return [];
 }
 
 function clickDropdownItem(host, target, aliases) {
-  for (const item of dropdownItems(host)) {
-    if (labelMatchesTarget(item.textContent, target, aliases)) {
-      clickLikeUser(item);
-      return true;
-    }
+  // A later retry must not flip another row's panel once this field is already
+  // showing the value (the panel it wanted has closed by then).
+  if (!host || !host.isConnected) return false;
+  if (labelMatchesTarget(controlLabelText(host), target, aliases)) return false;
+
+  const items = dropdownItems(host, target, aliases);
+  if (items.length) {
+    dropdownItemCache.set(host, items.map((item) => collapseText(item.textContent)));
+  }
+  for (const item of items) {
+    if (!labelMatchesTarget(item.textContent, target, aliases)) continue;
+    clickLikeUser(item);
+    return true;
   }
   return false;
+}
+
+// Some builds stop honouring synthetic item clicks once the overlay has
+// re-rendered mid-animation. The component's own keyboard handling still works:
+// open, step to the option, confirm.
+function keyboardPickOption(host, index) {
+  const container = dropdownContainer(host);
+  if (!container || !container.focus) return false;
+  container.focus();
+  const fire = (key) => {
+    container.dispatchEvent(new KeyboardEvent("keydown", { key, bubbles: true, cancelable: true }));
+    container.dispatchEvent(new KeyboardEvent("keyup", { key, bubbles: true, cancelable: true }));
+  };
+  fire("ArrowDown");
+  fire("Home");
+  for (let i = 0; i < index; i += 1) fire("ArrowDown");
+  fire("Enter");
+  return true;
 }
 
 function setPrimeNgSelect(host, value, aliases) {
   const target = String(value || "").trim();
   if (!target) return true;
-  if (labelMatchesTarget(controlLabelText(host), target, aliases)) return true;
+  if (labelMatchesTarget(controlLabelText(host), target, aliases)) {
+    host.dataset.autoSelectTries = "0";
+    delete host.__tatkalPanelsBefore;
+    return true;
+  }
 
   const now = Date.now();
   const lastTry = parseInt(host.dataset.autoSelectAt || "0", 10);
-  if (now - lastTry < 1200) return false;
+  if (now - lastTry < 700) return false;
+
+  const tries = parseInt(host.dataset.autoSelectTries || "0", 10) + 1;
   host.dataset.autoSelectAt = String(now);
+  host.dataset.autoSelectTries = String(tries);
 
-  const trigger = host.querySelector(".p-dropdown-trigger, .ui-dropdown-trigger, .p-select-trigger");
-  clickLikeUser(trigger || host);
+  if (tries > 3) {
+    const seen = dropdownItemCache.get(host) || [];
+    const index = seen.findIndex((text) => labelMatchesTarget(text, target, aliases));
+    if (index >= 0) keyboardPickOption(host, index);
+    return false;
+  }
 
-  // The overlay is rendered a moment after the trigger tap, so look for the item
-  // a few times instead of one shot; a single miss left the row on its default.
-  for (const delay of [60, 200, 400]) {
-    setTimeout(() => clickDropdownItem(host, target, aliases), delay);
+  host.__tatkalPanelsBefore = visibleDropdownPanels();
+  clickLikeUser(dropdownContainer(host));
+
+  // The overlay is rendered a moment after the tap, so look for the item a few
+  // times instead of one shot; a single miss left the row on its default.
+  for (const delay of [50, 150, 350, 700]) {
+    setTimeout(() => {
+      if (!host.isConnected) return;
+      if (labelMatchesTarget(controlLabelText(host), target, aliases)) return;
+      clickDropdownItem(host, target, aliases);
+    }, delay);
   }
   return false;
 }
@@ -1135,47 +1234,100 @@ function findPassengerRowScope(nameInput) {
   return best || nameInput.parentElement;
 }
 
-const GENDER_OPTION_TEXT_RE = /^(male|female|transgender)$/i;
-const BERTH_OPTION_TEXT_RE = /^(no pref(erence)?|lower|middle|upper|side lower|side upper|window side)$/i;
+const CONTROL_KIND_RULES = {
+  gender: {
+    nameRe: /gender/i,
+    hintRe: /^(select\s*)?gender$|^male$|^female$|^transgender$/i,
+    optionRe: /^(male|female|transgender)$/i,
+  },
+  berth: {
+    nameRe: /berth|choice/i,
+    hintRe: /^(select\s*)?berth(\s*preference)?$|^no preference$|^lower$|^middle$|^upper$|^side lower$|^side upper$|^window side$/i,
+    optionRe: /^(no pref(erence)?|lower|middle|upper|side lower|side upper|window side)$/i,
+  },
+};
 
-// Rows created by "Add Passenger" sometimes drop the formcontrolname attribute,
-// so fall back to the control's own options: a select (or PrimeNG dropdown)
-// offering Male/Female is the gender field, one offering berth names is berth.
-function findRowControl(scope, controlName, optionTextRe) {
-  const named = Array.from(
-    scope.querySelectorAll(
-      `select[formcontrolname="${controlName}"], p-dropdown[formcontrolname="${controlName}"], p-select[formcontrolname="${controlName}"]`
-    )
+function attrMatches(el, re) {
+  return (
+    re.test(el.getAttribute("formcontrolname") || "") ||
+    re.test(el.getAttribute("name") || "") ||
+    re.test(el.getAttribute("id") || "") ||
+    re.test(el.getAttribute("aria-label") || "")
   );
+}
+
+function selectOptionTexts(el) {
+  return el.tagName === "SELECT" ? Array.from(el.options || []).map((o) => collapseText(o.textContent)) : [];
+}
+
+// The p-dropdown element, its inner .p-dropdown div and a select nested inside a
+// custom wrapper all describe the same field. A native select is always kept —
+// it is the real Angular control — and only nested dropdown wrappers collapse.
+function uniqueControls(root) {
+  const all = Array.from(root.querySelectorAll(`select, ${DROPDOWN_ROOT_SELECTOR}`));
+  return all.filter((el) => {
+    if (el.tagName === "SELECT") return true;
+    return !all.some((other) => other !== el && other.tagName !== "SELECT" && other.contains(el));
+  });
+}
+
+function looksLikeControl(el, kind) {
+  const rule = CONTROL_KIND_RULES[kind];
+  if (!rule || !el) return false;
+  if (attrMatches(el, rule.nameRe)) return true;
+  if (selectOptionTexts(el).some((text) => rule.optionRe.test(text))) return true;
+  if (el.tagName === "SELECT") return false;
+  const label = controlLabelText(el);
+  if (!label) return false;
+  return rule.hintRe.test(label) || label.split(/\s+/).some((part) => rule.optionRe.test(part));
+}
+
+// Rows created by "Add Passenger" sometimes drop the formcontrolname attribute
+// (or render outside the element that holds the name input), so match the field
+// by its own attributes, then by the values it can hold.
+function findRowControl(scope, controlName, kind) {
+  const controls = uniqueControls(scope);
+  const named = controls.filter(
+    (el) => (el.getAttribute("formcontrolname") || "").toLowerCase() === controlName.toLowerCase()
+  );
+  // A native select is the Angular control even when a custom widget hides it.
+  const namedSelect = named.find((el) => el.tagName === "SELECT");
+  if (namedSelect) return namedSelect;
   const namedVisible = named.find(isVisible);
   if (namedVisible) return namedVisible;
+  if (named[0]) return named[0];
 
-  for (const select of scope.querySelectorAll("select")) {
-    if (!isVisible(select)) continue;
-    const texts = Array.from(select.options || []).map((o) => collapseText(o.textContent));
-    if (texts.length && texts.some((t) => optionTextRe.test(t))) return select;
-  }
-  for (const dropdown of scope.querySelectorAll("p-dropdown, p-select, .p-dropdown, .ui-dropdown")) {
-    if (!isVisible(dropdown)) continue;
-    const label = controlLabelText(dropdown);
-    if (optionTextRe.test(label)) return dropdown;
-    if (label && label.split(" ").some((part) => optionTextRe.test(part))) return dropdown;
-  }
-  return named[0] || null;
+  const visibleMatch = controls.filter(isVisible).find((el) => looksLikeControl(el, kind));
+  if (visibleMatch) return visibleMatch;
+  return controls.find((el) => looksLikeControl(el, kind)) || null;
+}
+
+// Controls of each kind in page order, mirroring IRCTC's passenger row order.
+function passengerControlPools() {
+  const visible = uniqueControls(document).filter(isVisible);
+  return {
+    gender: visible.filter((el) => looksLikeControl(el, "gender")),
+    berth: visible.filter((el) => looksLikeControl(el, "berth")),
+  };
 }
 
 function collectPassengerRows() {
-  return Array.from(document.querySelectorAll(PASSENGER_NAME_SELECTOR))
-    .filter(isVisible)
-    .map((nameInput) => {
-      const scope = findPassengerRowScope(nameInput) || document;
-      return {
-        name: nameInput,
-        age: scope.querySelector(PASSENGER_AGE_SELECTOR),
-        gender: findRowControl(scope, "passengerGender", GENDER_OPTION_TEXT_RE),
-        berth: findRowControl(scope, "passengerBerthChoice", BERTH_OPTION_TEXT_RE),
-      };
-    });
+  const nameInputs = Array.from(document.querySelectorAll(PASSENGER_NAME_SELECTOR)).filter(isVisible);
+  const pools = passengerControlPools();
+  return nameInputs.map((nameInput, index) => {
+    const scope = findPassengerRowScope(nameInput) || document;
+    const row = {
+      name: nameInput,
+      age: scope.querySelector(PASSENGER_AGE_SELECTOR),
+      gender: findRowControl(scope, "passengerGender", "gender"),
+      berth: findRowControl(scope, "passengerBerthChoice", "berth"),
+    };
+    // A row whose controls sit outside the name input's scope still owns the
+    // n-th gender/berth control on the page.
+    if (!row.gender && pools.gender.length >= nameInputs.length) row.gender = pools.gender[index];
+    if (!row.berth && pools.berth.length >= nameInputs.length) row.berth = pools.berth[index];
+    return row;
+  });
 }
 
 // The psgninput header prints the date the ticket is actually booked for
@@ -1465,6 +1617,7 @@ let trainListSince = 0;
 let trainRetryKey = "";
 let trainRetryCount = 0;
 let trainRetryAt = 0;
+let trainDateClickedAt = 0;
 
 // Route-scoped one-shot actions. Module state (not element datasets) survives
 // Angular re-renders, so the payment tab cannot be re-clicked on every tick.
@@ -1702,29 +1855,59 @@ function cellShowsDay(cellText, prefix, day) {
   return re.test(text);
 }
 
-function findAvailabilityCell(train, parsedJourney, coachClass) {
-  const isAvailable = (el) => {
-    const txt = (el.innerText || "").toUpperCase();
-    return (
-      txt.includes("AVAILABLE") || txt.includes("WL") || txt.includes("RAC") || txt.includes("CURR_AVBL")
-    );
-  };
-  const all = Array.from(
-    train.querySelectorAll("td div.pre-avl, li.ui-state-default")
-  ).filter((el) => isVisible(el) && isAvailable(el));
-  if (!all.length || !parsedJourney) return null;
+// Date chips ("Fri, 10 Nov") and availability cells ("AVAILABLE-0012") are
+// separate elements on the live page; the chips name the day, the cells hold the
+// seats for whichever chip is selected.
+function dateCellPool(train) {
+  return Array.from(train.querySelectorAll("td div.pre-avl, li.ui-state-default, .pre-avl")).filter(
+    (el) => isVisible(el) && !el.querySelector("div.pre-avl, td, li, table")
+  );
+}
 
-  const targetPrefix = getIrctcCardDatePrefix(parsedJourney);
-  const dateCells = all.filter((el) => cellShowsDay(el.innerText, targetPrefix, parsedJourney.day));
-  if (!dateCells.length) return null;
+// Only a cell that names the wanted date may be clicked. An availability cell for
+// another day switches the booking to that day — the wrong date — so an absent
+// date is a hard stop, never a fallback to the first cell.
+function findDateCell(train, parsedJourney, coachClass) {
+  if (!parsedJourney) return null;
+  const prefix = getIrctcCardDatePrefix(parsedJourney);
+  const named = dateCellPool(train).filter((el) =>
+    cellShowsDay(el.innerText, prefix, parsedJourney.day)
+  );
+  if (!named.length) return null;
 
-  // When a date cell also carries the class code, that is the one IRCTC will act
-  // on; without the code the date alone still identifies the right cell.
+  // When a date cell also carries the class code, that is the one IRCTC acts on;
+  // without the code the date alone still identifies the right cell.
   const pattern = classTokenPattern(coachClass);
   const classCells = pattern
-    ? dateCells.filter((el) => pattern.test((el.innerText || "").toUpperCase()))
+    ? named.filter((el) => pattern.test((el.innerText || "").toUpperCase()))
     : [];
-  return classCells[0] || dateCells[0];
+  return classCells[0] || named[0];
+}
+
+const NO_SEATS_RE = /\bREGRET\b|\bNOT\s+AVAILABLE\b|\bTRAIN\s+DEPARTED\b|\bCANCELLED\b/i;
+
+// IRCTC prints REGRET (or similar) instead of seats when the date cannot be
+// booked. Booking that train would silently land on a different date.
+function dateCellBlockReason(train, parsedJourney) {
+  const cells = dateCellPool(train);
+  const named = parsedJourney
+    ? cells.filter((el) =>
+        cellShowsDay(el.innerText, getIrctcCardDatePrefix(parsedJourney), parsedJourney.day)
+      )
+    : [];
+  for (const el of named) {
+    const hit = (el.innerText || "").match(NO_SEATS_RE);
+    if (hit) return collapseText(hit[0]).toUpperCase();
+  }
+  return "";
+}
+
+function visibleRegretText(train) {
+  for (const el of dateCellPool(train)) {
+    const hit = (el.innerText || "").match(NO_SEATS_RE);
+    if (hit) return collapseText(hit[0]).toUpperCase();
+  }
+  return "";
 }
 
 function noteTrainRetry(key) {
@@ -1732,6 +1915,7 @@ function noteTrainRetry(key) {
   trainRetryKey = key;
   trainRetryCount = 0;
   trainRetryAt = 0;
+  trainDateClickedAt = 0;
 }
 
 let lastStepAt = 0;
@@ -1780,6 +1964,9 @@ function runAutomationStep() {
 
     let matchedTrain = false;
     let classCell = null;
+    let dateCell = null;
+    let dateState = "none"; // none | ok | missing | blocked
+    let dateBlockReason = "";
     let bookReady = false;
 
     containers.forEach((train) => {
@@ -1788,29 +1975,71 @@ function runAutomationStep() {
       matchedTrain = true;
 
       classCell = findTrainClassCell(train, config.coachClass);
-      const dateCell = findAvailabilityCell(train, parsedJourney, config.coachClass);
+      const chip = findDateCell(train, parsedJourney, config.coachClass);
+      if (chip) {
+        dateCell = chip;
+        if (dateState !== "blocked") {
+          const blocked = dateCellBlockReason(train, parsedJourney);
+          dateState = blocked ? "blocked" : "ok";
+          if (blocked) dateBlockReason = blocked;
+        }
+      } else if (dateState !== "ok" && dateState !== "blocked") {
+        dateState = "missing";
+      }
 
       if (classCell && !classCell.dataset.classClicked) {
         classCell.dataset.classClicked = "true";
         classCell.click();
       }
 
-      if (dateCell && !dateCell.dataset.dayClicked) {
+      if (dateState === "ok" && dateCell && !dateCell.dataset.dayClicked) {
         dateCell.dataset.dayClicked = "true";
         dateCell.click();
+        trainDateClickedAt = Date.now();
         console.log(`[Tatkal] date cell picked: ${collapseText(dateCell.innerText).slice(0, 40)}`);
       }
 
-      const bookBtn = train.querySelector('button.btnDefault.train_Search:not([disabled])');
-      if (bookBtn && bookBtn.innerText.toUpperCase().includes("BOOK NOW")) {
-        bookReady = true;
-        triggerCTA(bookBtn, 1200);
+      // The seats print only after the date chip selects; a REGRET there means
+      // this date cannot be booked, and Book Now must not fire for any other day.
+      if (
+        dateState === "ok" &&
+        dateCell &&
+        dateCell.dataset.dayClicked &&
+        Date.now() - (trainDateClickedAt || trainListSince) > 900
+      ) {
+        const regret = visibleRegretText(train);
+        if (regret) {
+          dateState = "blocked";
+          dateBlockReason = regret;
+        }
+      }
+
+      // Book Now is only safe once the wanted date chip exists, carries no
+      // REGRET, and the availability it opened has had time to render — the
+      // REGRET scan above needs its window before this can fire.
+      const dateReadyForBook =
+        dateState === "ok" &&
+        !!dateCell &&
+        dateCell.dataset.dayClicked === "true" &&
+        Date.now() - (trainDateClickedAt || trainListSince) >= 1300;
+
+      if (dateReadyForBook) {
+        const bookBtn = train.querySelector('button.btnDefault.train_Search:not([disabled])');
+        if (bookBtn && bookBtn.innerText.toUpperCase().includes("BOOK NOW")) {
+          bookReady = true;
+          triggerCTA(bookBtn, 1200);
+        }
       }
     });
 
     // A click can land before IRCTC finishes rendering the availability grid, so
     // retry the same cells a couple of times before asking for manual input.
-    if (matchedTrain && !bookReady && trainRetryCount < MAX_TRAIN_CLICK_RETRIES) {
+    if (
+      matchedTrain &&
+      dateState !== "blocked" &&
+      !bookReady &&
+      trainRetryCount < MAX_TRAIN_CLICK_RETRIES
+    ) {
       if (!trainRetryAt) {
         trainRetryAt = Date.now() + TRAIN_CLICK_RETRY_MS;
       } else if (Date.now() >= trainRetryAt) {
@@ -1820,15 +2049,29 @@ function runAutomationStep() {
           ((c.querySelector(".train-heading") || c).innerText || "").includes(config.trainNo)
         );
         if (retryTrain) {
-          (findTrainClassCell(retryTrain, config.coachClass) || classCell)?.click();
-          findAvailabilityCell(retryTrain, parsedJourney, config.coachClass)?.click();
+          findTrainClassCell(retryTrain, config.coachClass)?.click();
+          const retryChip = findDateCell(retryTrain, parsedJourney, config.coachClass);
+          if (retryChip && retryChip.dataset.dayClicked !== "true") {
+            retryChip.dataset.dayClicked = "true";
+            retryChip.click();
+            trainDateClickedAt = Date.now();
+          }
         }
       }
     }
 
     const settled = Date.now() - trainListSince > 5000;
+    const wantedLabel = parsedJourney ? formatDayMonth(parsedJourney) : "the popup date";
     if (bookReady) {
       setHudWarning("");
+    } else if (dateState === "blocked") {
+      setHudWarning(
+        `${config.trainNo} shows ${dateBlockReason} on ${wantedLabel} — NOT booking another date. Change date/train.`
+      );
+    } else if (settled && dateState === "missing") {
+      setHudWarning(
+        `No ${wantedLabel} availability for ${config.trainNo} here — NOT booking another date. Change date/train.`
+      );
     } else if (settled && !matchedTrain) {
       setHudWarning(`Train ${config.trainNo} not found in this list — pick it manually`);
     } else if (settled && !classCell) {
@@ -2120,6 +2363,7 @@ function resetEngineState() {
   trainRetryKey = "";
   trainRetryCount = 0;
   trainRetryAt = 0;
+  trainDateClickedAt = 0;
   bookingDateProbe = { path: "", date: null, at: 0 };
 }
 
