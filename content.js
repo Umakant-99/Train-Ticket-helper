@@ -1346,6 +1346,8 @@ const PASSENGER_AGE_SELECTOR = 'input[formcontrolname="passengerAge"], input[pla
 
 const filledPassengerNames = new Map();
 const nameFillTries = new Map();
+// A row that keeps failing needs one console line, not one per engine tick.
+const missingRowControlLogged = new Set();
 // Tracks how long a gender/berth value has refused to stick, so the HUD only
 // warns after the retries have had a fair chance rather than on the first tick.
 const stuckSelectSince = new Map();
@@ -1383,6 +1385,7 @@ function syncPassengerState(list) {
     addPassengerClicks = 0;
     filledPassengerNames.clear();
     nameFillTries.clear();
+    missingRowControlLogged.clear();
     stuckSelectSince.clear();
     passengersSettledAt = 0;
     passengersPendingSince = 0;
@@ -1474,26 +1477,79 @@ function findRowControl(scope, controlName, kind) {
 function passengerControlPools() {
   const visible = uniqueControls(document).filter(isVisible);
   return {
+    all: visible,
     gender: visible.filter((el) => looksLikeControl(el, "gender")),
     berth: visible.filter((el) => looksLikeControl(el, "berth")),
   };
 }
 
+// Rows created by "Add Passenger" can drop the formcontrolname attribute and
+// sit in wrappers of their own shape, so the DOM cannot say which gender
+// dropdown belongs to which row. What the page does guarantee is layout: one
+// row per visual line, in the order name, age, gender, country, berth. Any
+// dropdown sharing the name input's line is therefore this row's.
+function rowLineControls(nameInput, controls) {
+  const box = nameInput.getBoundingClientRect();
+  if (box.height <= 0) return [];
+  const centerY = box.top + box.height / 2;
+  // Half a row height: a neighbouring row's fields are a full row away.
+  const tolerance = Math.max(14, box.height * 0.75);
+  return controls
+    .map((el) => ({ el, rect: el.getBoundingClientRect() }))
+    .filter(
+      ({ rect }) =>
+        rect.width > 0 &&
+        rect.height > 0 &&
+        Math.abs(rect.top + rect.height / 2 - centerY) <= tolerance
+    )
+    .sort((a, b) => a.rect.left - b.rect.left)
+    .map(({ el }) => el);
+}
+
+function lineRowControls(nameInput, controls, claimed) {
+  const free = rowLineControls(nameInput, controls).filter((el) => !claimed.has(el));
+  if (!free.length) return { gender: null, berth: null };
+  // Gender is the leftmost dropdown of the row; when its label cannot be read
+  // ("Male" missing, an added row's empty placeholder) IRCTC's fixed column
+  // order still puts it first.
+  const gender =
+    free.find((el) => looksLikeControl(el, "gender")) || (free.length >= 2 ? free[0] : null);
+  const rest = free.filter((el) => el !== gender);
+  // Berth closes the row, after the country dropdown. Requiring a second
+  // remaining control keeps a row without a berth field from binding country.
+  const berth =
+    rest.filter((el) => looksLikeControl(el, "berth")).pop() ||
+    (rest.length >= 2 ? rest[rest.length - 1] : null);
+  return { gender, berth };
+}
+
 function collectPassengerRows() {
   const nameInputs = Array.from(document.querySelectorAll(PASSENGER_NAME_SELECTOR)).filter(isVisible);
   const pools = passengerControlPools();
+  const claimed = new Set();
   const rows = nameInputs.map((nameInput, index) => {
     const scope = findPassengerRowScope(nameInput) || document;
+    const onLine = lineRowControls(nameInput, pools.all, claimed);
+    const scopedGender = findRowControl(scope, "passengerGender", "gender");
+    const scopedBerth = findRowControl(scope, "passengerBerthChoice", "berth");
     const row = {
       name: nameInput,
       age: scope.querySelector(PASSENGER_AGE_SELECTOR),
-      gender: findRowControl(scope, "passengerGender", "gender"),
-      berth: findRowControl(scope, "passengerBerthChoice", "berth"),
+      // A scope walk that lands on a control an earlier row already owns is the
+      // wrapper lying, not a second binding: leave it unset instead.
+      gender: onLine.gender || (scopedGender && !claimed.has(scopedGender) ? scopedGender : null),
+      berth: onLine.berth || (scopedBerth && !claimed.has(scopedBerth) ? scopedBerth : null),
     };
     // A row whose controls sit outside the name input's scope still owns the
-    // n-th gender/berth control on the page.
-    if (!row.gender && pools.gender.length >= nameInputs.length) row.gender = pools.gender[index];
-    if (!row.berth && pools.berth.length >= nameInputs.length) row.berth = pools.berth[index];
+    // n-th gender/berth control on the page that no earlier row has taken.
+    if (!row.gender && pools.gender.length >= nameInputs.length) {
+      row.gender = pools.gender.filter((el) => !claimed.has(el))[index] || null;
+    }
+    if (!row.berth && pools.berth.length >= nameInputs.length) {
+      row.berth = pools.berth.filter((el) => !claimed.has(el))[index] || null;
+    }
+    if (row.gender) claimed.add(row.gender);
+    if (row.berth) claimed.add(row.berth);
     return row;
   });
 
@@ -1589,6 +1645,25 @@ function isPassengerNameFilled(index, input, target) {
   return filledPassengerNames.get(index) === target && !!input.value.trim();
 }
 
+function logMissingRowControl(index, key, row) {
+  const id = `${index}:${key}`;
+  if (missingRowControlLogged.has(id)) return;
+  missingRowControlLogged.add(id);
+  const controls = uniqueControls(document).filter(isVisible);
+  const describe = (el) => ({
+    tag: el.tagName,
+    cls: String(el.className || "").slice(0, 80),
+    label: controlLabelText(el),
+    html: el.outerHTML.slice(0, 160),
+  });
+  console.warn(`[Tatkal] Passenger ${index + 1} ${key} not found`, {
+    nameInput: row.name ? row.name.outerHTML.slice(0, 160) : null,
+    onRowLine: row.name ? rowLineControls(row.name, controls).map(describe) : [],
+    genderControls: controls.filter((el) => looksLikeControl(el, "gender")).map(describe),
+    berthControls: controls.filter((el) => looksLikeControl(el, "berth")).map(describe),
+  });
+}
+
 function fillPassengerRows(rows, list) {
   let pending = false;
   let failedRow = 0;
@@ -1634,6 +1709,7 @@ function fillPassengerRows(rows, list) {
     if (list[i].gender) {
       if (!row.gender) {
         missing.push(`Passenger ${i + 1} gender`);
+        logMissingRowControl(i, "gender", row);
       } else {
         setAngularSelect(row.gender, list[i].gender, GENDER_ALIASES);
         const state = selectState(row.gender, list[i].gender, GENDER_ALIASES);
@@ -1644,6 +1720,7 @@ function fillPassengerRows(rows, list) {
     if (list[i].berth) {
       if (!row.berth) {
         missing.push(`Passenger ${i + 1} berth`);
+        logMissingRowControl(i, "berth", row);
       } else {
         setAngularSelect(row.berth, list[i].berth, BERTH_ALIASES);
         // IRCTC does not offer every berth the popup lists; a value it does not
@@ -2287,14 +2364,19 @@ function runAutomationStep() {
     const rows = collectPassengerRows();
     if (!rows.length || !passengers.length) return;
 
+    // Create every passenger row before touching a single field. Adding a row
+    // while the rows above are mid-selection makes Angular re-render the list,
+    // which is how passenger 2 kept falling back to IRCTC's default "Male".
     let rowWarning = "";
     if (passengers.length > rows.length) {
-      requestAddPassengerRow();
-      const canAddMore =
+      const addsPossible =
         !!findAddPassengerButton() && addPassengerClicks < MAX_ADD_PASSENGER_CLICKS;
-      rowWarning = canAddMore
-        ? `Adding passenger row ${rows.length + 1} of ${passengers.length}…`
-        : `Only ${rows.length} of ${passengers.length} passenger rows available — add the rest manually`;
+      if (addsPossible) {
+        requestAddPassengerRow();
+        setHudWarning(`Adding passenger row ${rows.length + 1} of ${passengers.length}…`);
+        return;
+      }
+      rowWarning = `Only ${rows.length} of ${passengers.length} passenger rows available — add the rest manually`;
     }
 
     const fillResult = fillPassengerRows(rows, passengers);
