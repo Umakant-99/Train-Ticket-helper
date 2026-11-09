@@ -193,17 +193,6 @@ function normalizeInline(text) {
   return (text || "").replace(/\s+/g, " ").trim().toUpperCase();
 }
 
-// Reads text before layout: textContent never forces a reflow, so a broad
-// selector only pays for getBoundingClientRect on the elements that match.
-function findClickableByText(matcher, selector) {
-  for (const el of document.querySelectorAll(selector)) {
-    const txt = normalizeInline(el.textContent);
-    if (!txt || !matcher(txt)) continue;
-    if (isVisible(el)) return el;
-  }
-  return null;
-}
-
 function findVisibleContinueButton() {
   // IRCTC renders duplicate layouts; querySelector can return the hidden copy,
   // which would silently swallow the click.
@@ -294,6 +283,122 @@ function isBhimUpiTabText(t) {
     !t.includes("CREDIT") &&
     !t.includes("WALLET")
   );
+}
+
+function isPaytmUpiText(t) {
+  return t.length <= 40 && /^PAYTM\s*UPI\b/.test(t);
+}
+
+// The first document-order match for a label is the outermost wrapper, and IRCTC
+// binds its click handler on the small card inside it. Clicking the wrapper
+// dispatches the event above the handler, so the option stays visually
+// unselected while the script happily moves on to Pay & Book. Pick the match
+// with the shortest text, then the deepest node: every wrapper around the label
+// reads the same text, so depth is what separates the card from its container.
+function elementDepth(el) {
+  let depth = 0;
+  for (let node = el; node; node = node.parentElement) depth += 1;
+  return depth;
+}
+
+function findInnermostByText(matcher, selector) {
+  let best = null;
+  let bestLen = Infinity;
+  let bestDepth = -1;
+  for (const el of document.querySelectorAll(selector)) {
+    const txt = normalizeInline(el.textContent);
+    if (!txt || txt.length > bestLen || !matcher(txt)) continue;
+    const depth = elementDepth(el);
+    if (txt.length === bestLen && depth <= bestDepth) continue;
+    if (!isVisible(el)) continue;
+    best = el;
+    bestLen = txt.length;
+    bestDepth = depth;
+  }
+  return best;
+}
+
+// Fallback for releases where the label sits in markup the selector list does
+// not cover. Bounded like the overlay probe; callers cache the result.
+function findTextHost(matcher) {
+  if (!document.body) return null;
+  const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+  let visited = 0;
+  let node;
+  while ((node = walker.nextNode()) && visited < 8000) {
+    visited += 1;
+    const raw = node.nodeValue;
+    if (!raw || raw.length > 40) continue;
+    const txt = normalizeInline(raw);
+    if (!txt || !matcher(txt)) continue;
+    const host = node.parentElement;
+    if (host && isVisible(host)) return host;
+  }
+  return null;
+}
+
+const textHostProbes = new Map();
+const TEXT_HOST_PROBE_TTL_MS = 600;
+
+function probeTextHost(key, matcher) {
+  const now = Date.now();
+  const cached = textHostProbes.get(key);
+  if (cached && cached.host && cached.host.isConnected && now - cached.at < 3000) return cached.host;
+  if (cached && now - cached.at < TEXT_HOST_PROBE_TTL_MS) return cached.host;
+  const host = findTextHost(matcher);
+  textHostProbes.set(key, { at: now, host });
+  return host;
+}
+
+function findPaymentTab() {
+  return (
+    findInnermostByText(isBhimUpiTabText, PAYMENT_TAB_SELECTOR) ||
+    probeTextHost("tab", isBhimUpiTabText)
+  );
+}
+
+function findPaytmOption() {
+  return findInnermostByText(isPaytmUpiText, PAYMENT_OPTION_SELECTOR) || probeTextHost("paytm", isPaytmUpiText);
+}
+
+function paymentOptionScope(host) {
+  return host.closest(".bank-box, .col-xs-12, li, label") || host.parentElement || host;
+}
+
+function isPaymentOptionSelected(host) {
+  const scope = paymentOptionScope(host);
+  for (const input of scope.querySelectorAll('input[type="radio"]')) {
+    if (input.checked) return true;
+  }
+  for (const box of scope.querySelectorAll(".p-radiobutton-box, .ui-radiobutton-box")) {
+    if (box.classList.contains("p-radiobutton-checked") || box.classList.contains("ui-state-active")) {
+      return true;
+    }
+  }
+  // IRCTC flags the chosen card by class; keep the walk inside the card so a
+  // parent panel's own "active" class cannot pass for a selection.
+  let node = host;
+  for (let depth = 0; node && depth < 3; depth += 1, node = node.parentElement) {
+    for (const cls of node.classList || []) {
+      if (/(^|-)(active|selected|checked)$/i.test(cls)) return true;
+    }
+  }
+  return false;
+}
+
+function clickPaymentOption(host, attempt = 0) {
+  const scope = paymentOptionScope(host);
+  const radio = scope.querySelector('input[type="radio"]');
+  if (radio && !radio.checked) {
+    radio.click();
+    if (radio.checked) return true;
+  }
+  // Escalate outwards only if the previous tap did not register: the handler may
+  // sit on the card, its label, or a wrapper above the text.
+  const label = host.closest("label") || scope.querySelector("label");
+  const candidates = [label, host, host.parentElement, scope].filter(Boolean);
+  const target = candidates[Math.min(attempt, candidates.length - 1)];
+  return triggerCTA(target, 0);
 }
 
 let payModeSelectedAt = 0;
@@ -1024,19 +1129,25 @@ let trainRetryAt = 0;
 // Route-scoped one-shot actions. Module state (not element datasets) survives
 // Angular re-renders, so the payment tab cannot be re-clicked on every tick.
 let activePath = "";
+let paymentStageSince = 0;
 let paymentTabClickedAt = 0;
 let paymentTabAttempts = 0;
 let paytmOptionClickedAt = 0;
 let paytmOptionAttempts = 0;
+// Set only after the card actually reads as selected, never by the tap itself.
+let paytmVerifiedAt = 0;
 
 function noteRouteChange() {
   const path = window.location.pathname;
   if (path === activePath) return false;
   activePath = path;
+  paymentStageSince = 0;
   paymentTabClickedAt = 0;
   paymentTabAttempts = 0;
   paytmOptionClickedAt = 0;
   paytmOptionAttempts = 0;
+  paytmVerifiedAt = 0;
+  textHostProbes.clear();
   // Re-entering train-list must start its settle timer over, otherwise the
   // "pick it manually" hints fire on arrival from a stale timestamp.
   trainListSince = 0;
@@ -1469,48 +1580,57 @@ function runAutomationStep() {
 
   // STEP 6B: PAYMENT METHODS (bkgPaymentOptions) -> BHIM/UPI -> PAYTM -> PAY & BOOK
   if (window.location.hostname.includes("irctc.co.in") && url.includes("payment")) {
+    if (!paymentStageSince) paymentStageSince = Date.now();
+
     // Each stage waits for the one before it: the option list does not exist until
     // the tab's XHR lands. (The old code rescanned every div on every tick, reading
     // innerText each time, which forced a reflow per node on this heavy page.)
-    if (!paymentTabClickedAt || (paytmOptionAttempts === 0 && Date.now() - paymentTabClickedAt > 4000)) {
-      const tab = findClickableByText(isBhimUpiTabText, PAYMENT_TAB_SELECTOR);
-      const tabTarget = tab ? tab.querySelector("a, span") || tab : null;
-      if (tabTarget && triggerCTA(tabTarget, 1500)) {
+    if (
+      !paymentTabClickedAt ||
+      (paytmOptionAttempts === 0 &&
+        paymentTabAttempts < 3 &&
+        Date.now() - paymentTabClickedAt > 4000)
+    ) {
+      const tab = findPaymentTab();
+      if (tab && triggerCTA(tab, 1500)) {
         paymentTabClickedAt = Date.now();
         paymentTabAttempts += 1;
         console.log(`[Tatkal] BHIM/UPI payment tab clicked (attempt ${paymentTabAttempts})`);
+      } else if (!paymentTabClickedAt && Date.now() - paymentStageSince > 6000) {
+        setHudWarning("BHIM/UPI tab not found — select it and Paytm UPI manually");
       }
     }
 
-    if (paymentTabClickedAt && !paytmOptionClickedAt) {
-      const option = findClickableByText((t) => t.startsWith("PAYTM UPI"), PAYMENT_OPTION_SELECTOR);
+    if (paymentTabClickedAt && !paytmVerifiedAt) {
+      const option = findPaytmOption();
       if (option) {
-        const clickableBox = option.closest(".bank-box, .col-xs-12, .bank-text") || option;
-        if (triggerCTA(clickableBox, 1200)) {
-          paytmOptionClickedAt = Date.now();
-          paytmOptionAttempts += 1;
+        if (isPaymentOptionSelected(option)) {
+          paytmVerifiedAt = Date.now();
           setHudWarning("");
-          console.log("[Tatkal] PAYTM UPI selected");
+          console.log("[Tatkal] PAYTM UPI selected and verified");
+        } else if (paytmOptionAttempts < 3 && Date.now() - paytmOptionClickedAt > 700) {
+          if (clickPaymentOption(option, paytmOptionAttempts)) {
+            paytmOptionClickedAt = Date.now();
+            paytmOptionAttempts += 1;
+            console.log(`[Tatkal] PAYTM UPI clicked (attempt ${paytmOptionAttempts})`);
+          }
+        } else if (paytmOptionAttempts >= 3 && Date.now() - paytmOptionClickedAt > 1200) {
+          setHudWarning("Paytm UPI did not register — tap it, then Pay & Book");
         }
-      }
-    } else if (paytmOptionClickedAt && Date.now() - paytmOptionClickedAt > 4000) {
-      // The option click can land before Angular binds it; retry once instead of
-      // sitting on a disabled Pay & Book button.
-      const payBtn = findVisibleButtonByText("Pay & Book");
-      if ((!payBtn || payBtn.disabled) && paytmOptionAttempts < 2) {
-        paytmOptionClickedAt = 0;
+      } else if (Date.now() - paymentStageSince > 6000) {
+        setHudWarning("Payment options did not load — pick the UPI option manually");
       }
     }
 
-    if (paytmOptionClickedAt) {
+    // Only submit once a payment mode is confirmed selected: Pay & Book with no
+    // mode picked just bounces off IRCTC with "Unable to process Payment request".
+    if (paytmVerifiedAt) {
       const payAndBookBtn =
         findVisibleButtonByText("Pay & Book") ||
         document.querySelector("button.btn-primary:not([disabled])");
       if (payAndBookBtn && !payAndBookBtn.disabled) {
         clickSubmitOnce(payAndBookBtn, "Pay & Book");
       }
-    } else if (paymentTabClickedAt && Date.now() - paymentTabClickedAt > 5000) {
-      setHudWarning("Payment options did not load — pick the UPI option manually");
     }
   }
 }
