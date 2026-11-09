@@ -533,6 +533,44 @@ const GENDER_ALIASES = {
   t: ["t", "transgender"],
 };
 
+const BERTH_ALIASES = {
+  lb: ["lb", "lower"],
+  mb: ["mb", "middle"],
+  ub: ["ub", "upper"],
+  sl: ["sl", "side lower"],
+  su: ["su", "side upper"],
+  ws: ["ws", "window side"],
+};
+
+function collapseText(text) {
+  return String(text || "").replace(/\s+/g, " ").trim();
+}
+
+// PrimeNG dropdowns keep the picked option in a label element, not in a value
+// property, so this is the only text that reflects what the passenger row shows.
+function controlLabelText(host) {
+  if (!host) return "";
+  const labelEl = host.querySelector(".p-dropdown-label, .ui-dropdown-label, .p-select-label");
+  return collapseText(labelEl ? labelEl.textContent : host.textContent).toUpperCase();
+}
+
+function labelMatchesTarget(label, target, aliases) {
+  const shown = collapseText(label).toUpperCase();
+  const wanted = String(target || "").trim().toUpperCase();
+  if (!shown || !wanted) return false;
+  if (shown === wanted) return true;
+  const accepted = aliases && aliases[wanted.toLowerCase()];
+  return !!accepted && accepted.includes(shown.toLowerCase());
+}
+
+function clickLikeUser(el) {
+  if (!el) return false;
+  el.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true }));
+  el.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, cancelable: true }));
+  el.click();
+  return true;
+}
+
 function optionMatchesTarget(option, target, aliases) {
   const value = String(option.value || "").trim();
   const label = (option.textContent || "").trim();
@@ -549,29 +587,53 @@ function findSelectOption(element, value, aliases) {
   return Array.from(element.options || []).find((o) => optionMatchesTarget(o, target, aliases)) || null;
 }
 
-// True when the control already shows the wanted value, or when it is not a
-// native select / does not offer that option — in both cases there is nothing
-// further this script can do, so the caller must not stall the booking on it.
+// "settled"    the control visibly shows the wanted value
+// "pending"    the value is not shown yet (still loading, or a click did not take)
+// "unsupported" a native select with options simply does not offer that value
+function selectState(element, value, aliases, allowMissing = false) {
+  const target = String(value || "").trim();
+  if (!element || !target) return "settled";
+
+  if (element.tagName === "SELECT") {
+    const match = findSelectOption(element, target, aliases);
+    if (!match) return allowMissing && element.options.length > 1 ? "unsupported" : "pending";
+    return element.value === match.value ? "settled" : "pending";
+  }
+
+  const label = controlLabelText(element);
+  if (!label) return "settled";
+  return labelMatchesTarget(label, target, aliases) ? "settled" : "pending";
+}
+
 function selectIsSettled(element, value, aliases) {
-  if (!element || element.tagName !== "SELECT") return true;
-  const match = findSelectOption(element, value, aliases);
-  if (!match) return true;
-  return element.value === match.value;
+  return selectState(element, value, aliases) === "settled";
 }
 
 // PrimeNG renders some dropdowns as a div with no value to assign, so the list
 // has to be opened and the matching item clicked. The overlay is normally
 // appended to <body>, but a global query would hit another row's list first and
-// flip that passenger's value, so prefer the items inside this host and only
-// fall back to the last visible panel.
+// flip that passenger's value, so prefer the panel this host points at, then the
+// items inside the host, and only then the last visible panel.
 function dropdownItems(host) {
   const own = host.querySelectorAll(
     ".p-dropdown-items li, .ui-dropdown-items li, p-dropdownitem li, .p-select-items li, [role='option']"
   );
   if (own.length) return Array.from(own);
 
+  const anchors = [host, ...host.querySelectorAll("[aria-controls], [aria-owns]")];
+  for (const anchor of anchors) {
+    const ref = anchor.getAttribute && (anchor.getAttribute("aria-controls") || anchor.getAttribute("aria-owns"));
+    if (!ref) continue;
+    const panel = document.getElementById(ref.split(" ")[0]);
+    if (!panel) continue;
+    const items = panel.querySelectorAll("[role='option'], li");
+    if (items.length) return Array.from(items);
+  }
+
   const panels = Array.from(
-    document.querySelectorAll(".p-dropdown-panel, .ui-dropdown-panel, .p-select-panel")
+    document.querySelectorAll(
+      ".p-dropdown-panel, .ui-dropdown-panel, .p-select-panel, .p-select-overlay, [role='listbox']"
+    )
   );
   for (let i = panels.length - 1; i >= 0; i -= 1) {
     if (!isVisible(panels[i])) continue;
@@ -581,16 +643,20 @@ function dropdownItems(host) {
   return [];
 }
 
+function clickDropdownItem(host, target, aliases) {
+  for (const item of dropdownItems(host)) {
+    if (labelMatchesTarget(item.textContent, target, aliases)) {
+      clickLikeUser(item);
+      return true;
+    }
+  }
+  return false;
+}
+
 function setPrimeNgSelect(host, value, aliases) {
   const target = String(value || "").trim();
   if (!target) return true;
-
-  const labelEl = host.querySelector(".p-dropdown-label, .ui-dropdown-label, .p-select-label");
-  const label = (labelEl ? labelEl.textContent : host.textContent || "").trim();
-  const accepted = aliases && aliases[target.toLowerCase()];
-  if (label.toUpperCase() === target.toUpperCase() || (accepted && accepted.includes(label.toLowerCase()))) {
-    return true;
-  }
+  if (labelMatchesTarget(controlLabelText(host), target, aliases)) return true;
 
   const now = Date.now();
   const lastTry = parseInt(host.dataset.autoSelectAt || "0", 10);
@@ -598,16 +664,13 @@ function setPrimeNgSelect(host, value, aliases) {
   host.dataset.autoSelectAt = String(now);
 
   const trigger = host.querySelector(".p-dropdown-trigger, .ui-dropdown-trigger, .p-select-trigger");
-  (trigger || host).click();
-  setTimeout(() => {
-    for (const item of dropdownItems(host)) {
-      const text = (item.textContent || "").trim();
-      if (text.toUpperCase() === target.toUpperCase() || (accepted && accepted.includes(text.toLowerCase()))) {
-        item.click();
-        return;
-      }
-    }
-  }, 200);
+  clickLikeUser(trigger || host);
+
+  // The overlay is rendered a moment after the trigger tap, so look for the item
+  // a few times instead of one shot; a single miss left the row on its default.
+  for (const delay of [60, 200, 400]) {
+    setTimeout(() => clickDropdownItem(host, target, aliases), delay);
+  }
   return false;
 }
 
@@ -1079,19 +1142,26 @@ const BERTH_OPTION_TEXT_RE = /^(no pref(erence)?|lower|middle|upper|side lower|s
 // so fall back to the control's own options: a select (or PrimeNG dropdown)
 // offering Male/Female is the gender field, one offering berth names is berth.
 function findRowControl(scope, controlName, optionTextRe) {
-  const named = scope.querySelector(
-    `select[formcontrolname="${controlName}"], p-dropdown[formcontrolname="${controlName}"]`
+  const named = Array.from(
+    scope.querySelectorAll(
+      `select[formcontrolname="${controlName}"], p-dropdown[formcontrolname="${controlName}"], p-select[formcontrolname="${controlName}"]`
+    )
   );
-  if (named) return named;
+  const namedVisible = named.find(isVisible);
+  if (namedVisible) return namedVisible;
 
   for (const select of scope.querySelectorAll("select")) {
-    const texts = Array.from(select.options || []).map((o) => (o.textContent || "").trim());
+    if (!isVisible(select)) continue;
+    const texts = Array.from(select.options || []).map((o) => collapseText(o.textContent));
     if (texts.length && texts.some((t) => optionTextRe.test(t))) return select;
   }
-  for (const dropdown of scope.querySelectorAll("p-dropdown, .p-dropdown, .ui-dropdown, p-select")) {
-    if (optionTextRe.test((dropdown.textContent || "").trim())) return dropdown;
+  for (const dropdown of scope.querySelectorAll("p-dropdown, p-select, .p-dropdown, .ui-dropdown")) {
+    if (!isVisible(dropdown)) continue;
+    const label = controlLabelText(dropdown);
+    if (optionTextRe.test(label)) return dropdown;
+    if (label && label.split(" ").some((part) => optionTextRe.test(part))) return dropdown;
   }
-  return null;
+  return named[0] || null;
 }
 
 function collectPassengerRows() {
@@ -1106,6 +1176,49 @@ function collectPassengerRows() {
         berth: findRowControl(scope, "passengerBerthChoice", BERTH_OPTION_TEXT_RE),
       };
     });
+}
+
+// The psgninput header prints the date the ticket is actually booked for
+// ("Boarding Date: 13 Nov 2026"). Once the search is committed that header is
+// the only place the page admits the journey date, so it is read once per route
+// and compared with the popup before Continue.
+let bookingDateProbe = { path: "", date: null, at: 0 };
+
+function readBookingBoardingDate() {
+  const now = Date.now();
+  if (bookingDateProbe.path === window.location.pathname) {
+    if (bookingDateProbe.date) return bookingDateProbe.date;
+    // The header renders a beat after the route; keep looking until it shows up.
+    if (now - bookingDateProbe.at < 700) return null;
+  }
+  bookingDateProbe = { path: window.location.pathname, date: null, at: now };
+
+  const candidates = document.querySelectorAll("div, span, p, li");
+  const limit = Math.min(candidates.length, 3000);
+  let text = "";
+  for (let i = 0; i < limit; i += 1) {
+    const el = candidates[i];
+    if (el.children.length > 4) continue;
+    if (el.closest && el.closest("#tatkal-hud")) continue;
+    const shown = collapseText(el.textContent);
+    if (!shown || shown.length > 200 || !/boarding\s+date/i.test(shown)) continue;
+    if (!isVisible(el)) continue;
+    if (!text || shown.length < text.length) text = shown;
+  }
+
+  const m = text.match(/boarding\s+date\s*:?\s*(\d{1,2})\s+([A-Za-z]{3,})\s*(\d{4})?/i);
+  if (m) {
+    const monthIdx = MONTH_ABBR.findIndex((abbr) => abbr.toUpperCase() === m[2].slice(0, 3).toUpperCase());
+    if (monthIdx !== -1) {
+      const date = buildDate(+m[1], monthIdx + 1, m[3] ? +m[3] : new Date().getFullYear());
+      bookingDateProbe.date = date;
+    }
+  }
+  return bookingDateProbe.date;
+}
+
+function formatDayMonth(parsed) {
+  return `${String(parsed.day).padStart(2, "0")} ${MONTH_ABBR[parsed.month - 1]} ${parsed.year}`;
 }
 
 function findAddPassengerButton() {
@@ -1146,6 +1259,7 @@ function fillPassengerRows(rows, list) {
   let failedRow = 0;
   let allSettled = true;
   const stuckRows = [];
+  const missing = [];
 
   const noteStuck = (key, label, stuck) => {
     if (!stuck) {
@@ -1182,21 +1296,31 @@ function fillPassengerRows(rows, list) {
     if (target && row.name && row.name.value.trim()) filledPassengerNames.set(i, target);
     if (row.age && list[i].age) setAngularInput(row.age, String(list[i].age).trim());
 
-    if (row.gender && list[i].gender) {
-      setAngularSelect(row.gender, list[i].gender, GENDER_ALIASES);
-      const settled = selectIsSettled(row.gender, list[i].gender, GENDER_ALIASES);
-      if (!settled) allSettled = false;
-      noteStuck(`${i}:gender`, `Passenger ${i + 1} gender`, !settled);
+    if (list[i].gender) {
+      if (!row.gender) {
+        missing.push(`Passenger ${i + 1} gender`);
+      } else {
+        setAngularSelect(row.gender, list[i].gender, GENDER_ALIASES);
+        const state = selectState(row.gender, list[i].gender, GENDER_ALIASES);
+        if (state !== "settled") allSettled = false;
+        noteStuck(`${i}:gender`, `Passenger ${i + 1} gender`, state !== "settled");
+      }
     }
-    if (row.berth && list[i].berth) {
-      setAngularSelect(row.berth, list[i].berth);
-      const settled = selectIsSettled(row.berth, list[i].berth);
-      if (!settled) allSettled = false;
-      noteStuck(`${i}:berth`, `Passenger ${i + 1} berth`, !settled);
+    if (list[i].berth) {
+      if (!row.berth) {
+        missing.push(`Passenger ${i + 1} berth`);
+      } else {
+        setAngularSelect(row.berth, list[i].berth, BERTH_ALIASES);
+        // IRCTC does not offer every berth the popup lists; a value it does not
+        // have must not hold the booking forever.
+        const state = selectState(row.berth, list[i].berth, BERTH_ALIASES, true);
+        if (state === "pending") allSettled = false;
+        noteStuck(`${i}:berth`, `Passenger ${i + 1} berth`, state === "pending");
+      }
     }
   }
 
-  return { done: !pending && !isFillingPassengerName, failedRow, stuckRows, allSettled };
+  return { done: !pending && !isFillingPassengerName, failedRow, stuckRows, missing, allSettled };
 }
 
 function arePassengerRowsFilled(rows, list) {
@@ -1212,10 +1336,17 @@ function arePassengerRowsComplete(rows, list) {
   if (!arePassengerRowsFilled(rows, list)) return false;
   for (let i = 0; i < list.length; i++) {
     const row = rows[i];
-    // A wrong gender/berth is a wrong ticket, so do not press Continue while a
-    // native select still shows something else than the configured value.
-    if (row.gender && list[i].gender && !selectIsSettled(row.gender, list[i].gender, GENDER_ALIASES)) return false;
-    if (row.berth && list[i].berth && !selectIsSettled(row.berth, list[i].berth)) return false;
+    // A wrong gender/berth is a wrong ticket, so Continue stays held until the
+    // control visibly shows the configured value — a missing control is a hold,
+    // not a pass, because the row then keeps IRCTC's default.
+    if (list[i].gender) {
+      if (!row.gender) return false;
+      if (!selectIsSettled(row.gender, list[i].gender, GENDER_ALIASES)) return false;
+    }
+    if (list[i].berth) {
+      if (!row.berth) return false;
+      if (selectState(row.berth, list[i].berth, BERTH_ALIASES, true) === "pending") return false;
+    }
   }
   return true;
 }
@@ -1560,7 +1691,18 @@ function findTrainClassCell(train, coachClass) {
   return null;
 }
 
-function findAvailabilityCell(train, parsedJourney, dayPattern, coachClass) {
+// Only a cell that names the wanted date may be clicked. The old fallback took
+// the first available cell when the exact date was absent, and an availability
+// cell for another day switches the booking to that day — the wrong date.
+function cellShowsDay(cellText, prefix, day) {
+  const text = collapseText(cellText).toUpperCase();
+  if (!text) return false;
+  if (prefix && text.includes(prefix.toUpperCase())) return true;
+  const re = new RegExp(`^(?:[A-Z]{3},?\\s*)?0?${day}(?:\\s|$)`);
+  return re.test(text);
+}
+
+function findAvailabilityCell(train, parsedJourney, coachClass) {
   const isAvailable = (el) => {
     const txt = (el.innerText || "").toUpperCase();
     return (
@@ -1570,28 +1712,19 @@ function findAvailabilityCell(train, parsedJourney, dayPattern, coachClass) {
   const all = Array.from(
     train.querySelectorAll("td div.pre-avl, li.ui-state-default")
   ).filter((el) => isVisible(el) && isAvailable(el));
-  if (!all.length) return null;
-
-  // When the class code sits inside the availability cell, clicking a cell from
-  // another class would switch the selection back, so prefer the wanted class.
-  const pattern = classTokenPattern(coachClass);
-  const classCells = pattern
-    ? all.filter((el) => pattern.test((el.innerText || "").toUpperCase()))
-    : [];
-  const pool = classCells.length ? classCells : all;
+  if (!all.length || !parsedJourney) return null;
 
   const targetPrefix = getIrctcCardDatePrefix(parsedJourney);
-  if (targetPrefix) {
-    const exact = pool.find((el) =>
-      (el.innerText || "").toUpperCase().includes(targetPrefix.toUpperCase())
-    );
-    if (exact) return exact;
-  }
-  if (dayPattern) {
-    const dayHit = pool.find((el) => dayPattern.test(el.innerText || ""));
-    if (dayHit) return dayHit;
-  }
-  return pool[0];
+  const dateCells = all.filter((el) => cellShowsDay(el.innerText, targetPrefix, parsedJourney.day));
+  if (!dateCells.length) return null;
+
+  // When a date cell also carries the class code, that is the one IRCTC will act
+  // on; without the code the date alone still identifies the right cell.
+  const pattern = classTokenPattern(coachClass);
+  const classCells = pattern
+    ? dateCells.filter((el) => pattern.test((el.innerText || "").toUpperCase()))
+    : [];
+  return classCells[0] || dateCells[0];
 }
 
 function noteTrainRetry(key) {
@@ -1641,7 +1774,6 @@ function runAutomationStep() {
     }
 
     const parsedJourney = getEffectiveJourneyDate() || resolvedJourneyDate;
-    const dayPattern = parsedJourney ? new RegExp(`(^|[^0-9])0?${parsedJourney.day}([^0-9]|$)`) : null;
     const containers = getTrainContainers();
 
     noteTrainRetry(`${config.trainNo}|${config.coachClass}|${config.quota}`);
@@ -1656,7 +1788,7 @@ function runAutomationStep() {
       matchedTrain = true;
 
       classCell = findTrainClassCell(train, config.coachClass);
-      const dateCell = findAvailabilityCell(train, parsedJourney, dayPattern, config.coachClass);
+      const dateCell = findAvailabilityCell(train, parsedJourney, config.coachClass);
 
       if (classCell && !classCell.dataset.classClicked) {
         classCell.dataset.classClicked = "true";
@@ -1666,6 +1798,7 @@ function runAutomationStep() {
       if (dateCell && !dateCell.dataset.dayClicked) {
         dateCell.dataset.dayClicked = "true";
         dateCell.click();
+        console.log(`[Tatkal] date cell picked: ${collapseText(dateCell.innerText).slice(0, 40)}`);
       }
 
       const bookBtn = train.querySelector('button.btnDefault.train_Search:not([disabled])');
@@ -1688,7 +1821,7 @@ function runAutomationStep() {
         );
         if (retryTrain) {
           (findTrainClassCell(retryTrain, config.coachClass) || classCell)?.click();
-          findAvailabilityCell(retryTrain, parsedJourney, dayPattern, config.coachClass)?.click();
+          findAvailabilityCell(retryTrain, parsedJourney, config.coachClass)?.click();
         }
       }
     }
@@ -1741,8 +1874,20 @@ function runAutomationStep() {
     const fillResult = fillPassengerRows(rows, passengers);
     if (fillResult.failedRow) {
       rowWarning = `Passenger ${fillResult.failedRow} name not filled — type it manually`;
+    } else if (fillResult.missing.length) {
+      rowWarning = `${fillResult.missing.join(", ")} field not found — set it manually, Continue held`;
     } else if (fillResult.stuckRows.length) {
       rowWarning = `${fillResult.stuckRows.join(", ")} did not stick — set it manually`;
+    }
+
+    // A booking already committed to another date is a wrong ticket, so the page
+    // date has to agree with the popup before this script presses Continue.
+    const wantedDay = getEffectiveJourneyDate() || resolvedJourneyDate;
+    const boardingDay = readBookingBoardingDate();
+    const dateMismatch = !!(boardingDay && wantedDay && !sameDate(boardingDay, wantedDay));
+    if (dateMismatch) {
+      const note = `Page date ${formatDayMonth(boardingDay)} ≠ popup ${formatDayMonth(wantedDay)} — Continue held`;
+      rowWarning = rowWarning ? `${note} · ${rowWarning}` : note;
     }
 
     if (fillResult.done && fillResult.allSettled) {
@@ -1795,6 +1940,7 @@ function runAutomationStep() {
     }
 
     const formReady =
+      !dateMismatch &&
       fillResult.done &&
       arePassengerRowsComplete(rows, passengers) &&
       passengersSettledAt > 0 &&
@@ -1974,6 +2120,7 @@ function resetEngineState() {
   trainRetryKey = "";
   trainRetryCount = 0;
   trainRetryAt = 0;
+  bookingDateProbe = { path: "", date: null, at: 0 };
 }
 
 let lastInitAt = 0;
