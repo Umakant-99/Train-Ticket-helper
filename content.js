@@ -1615,27 +1615,33 @@ function formatDayMonth(parsed) {
   return `${String(parsed.day).padStart(2, "0")} ${MONTH_ABBR[parsed.month - 1]} ${parsed.year}`;
 }
 
+const ADD_PASSENGER_TEXT = /add\s*passenger/i;
+
+// IRCTC renders "+ Add Passenger" as a text link, not a <button>, and its
+// wrapper elements repeat the same words. Match on textContent first — reading
+// innerText or a bounding box for every span on the page forces layout on each
+// engine tick — then keep the innermost visible match.
 function findAddPassengerButton() {
-  const shown = (el) => (el.innerText || el.textContent || "").replace(/\s+/g, " ").trim();
-  // IRCTC renders this control as a text link, not a <button>, and its wrapper
-  // elements repeat the same words, so match the innermost visible element.
-  const candidates = Array.from(
-    document.querySelectorAll("button, a, span, p-button, [role='button']")
-  ).filter((el) => {
-    if (!isVisible(el) || el.disabled) return false;
-    if (el.closest("#tatkal-hud")) return false;
-    const text = shown(el);
-    return text.length > 0 && text.length <= 60 && /add\s*passenger/i.test(text);
-  });
+  const candidates = [];
+  for (const el of document.querySelectorAll(
+    "button, a, span, p-button, [role='button']"
+  )) {
+    if (el.disabled || el.closest("#tatkal-hud")) continue;
+    const text = collapseText(el.textContent);
+    if (text.length > 0 && text.length <= 60 && ADD_PASSENGER_TEXT.test(text)) {
+      candidates.push(el);
+    }
+  }
+  if (!candidates.length) return null;
   const innermost = candidates.filter(
     (el) => !candidates.some((other) => other !== el && el.contains(other))
-  );
-  return (
-    innermost.find((el) => /^\+?\s*add\s*passenger/i.test(shown(el))) || innermost[0] || null
-  );
+  ).filter(isVisible);
+  if (!innermost.length) return null;
+  return innermost.find((el) => /^\+?\s*add\s*passenger/i.test(collapseText(el.textContent))) ||
+    innermost[0];
 }
 
-function requestAddPassengerRow(currentRows) {
+function requestAddPassengerRow(currentRows, knownButton) {
   if (addPassengerClicks >= MAX_ADD_PASSENGER_CLICKS) return false;
   const now = Date.now();
   const waited = now - lastAddPassengerClickAt;
@@ -1646,7 +1652,7 @@ function requestAddPassengerRow(currentRows) {
   if (waited < ADD_PASSENGER_SETTLE_MS && currentRows <= addPassengerRowsAtLastClick) {
     return false;
   }
-  const btn = findAddPassengerButton();
+  const btn = knownButton || findAddPassengerButton();
   if (!btn) return false;
 
   lastAddPassengerClickAt = now;
@@ -2388,10 +2394,10 @@ function runAutomationStep() {
     // which is how passenger 2 kept falling back to IRCTC's default "Male".
     let rowWarning = "";
     if (passengers.length > rows.length) {
-      const addsPossible =
-        !!findAddPassengerButton() && addPassengerClicks < MAX_ADD_PASSENGER_CLICKS;
+      const addBtn = findAddPassengerButton();
+      const addsPossible = !!addBtn && addPassengerClicks < MAX_ADD_PASSENGER_CLICKS;
       if (addsPossible) {
-        requestAddPassengerRow(rows.length);
+        requestAddPassengerRow(rows.length, addBtn);
         setHudWarning(`Adding passenger row ${rows.length + 1} of ${passengers.length}…`);
         return;
       }
