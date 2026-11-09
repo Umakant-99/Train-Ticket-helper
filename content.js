@@ -1339,6 +1339,7 @@ const MAX_PASSENGERS = 6;
 const MAX_ADD_PASSENGER_CLICKS = 8;
 const MAX_NAME_FILL_TRIES = 4;
 const ADD_PASSENGER_CLICK_GAP_MS = 900;
+const ADD_PASSENGER_SETTLE_MS = 2500;
 
 const PASSENGER_NAME_SELECTOR =
   'p-autocomplete[formcontrolname="passengerName"] input, input[placeholder*="Passenger Name" i]';
@@ -1358,6 +1359,7 @@ let passengersPendingSince = 0;
 const PASSENGER_SETTLE_MS = 400;
 let addPassengerClicks = 0;
 let lastAddPassengerClickAt = 0;
+let addPassengerRowsAtLastClick = 0;
 let passengerStatePath = "";
 let passengerStateSignature = "";
 
@@ -1383,6 +1385,7 @@ function syncPassengerState(list) {
     passengerStatePath = path;
     passengerStateSignature = signature;
     addPassengerClicks = 0;
+    addPassengerRowsAtLastClick = 0;
     filledPassengerNames.clear();
     nameFillTries.clear();
     missingRowControlLogged.clear();
@@ -1613,25 +1616,41 @@ function formatDayMonth(parsed) {
 }
 
 function findAddPassengerButton() {
-  const candidates = Array.from(document.querySelectorAll("button, a.btn, a")).filter(
-    (el) => isVisible(el) && !el.disabled
+  const shown = (el) => (el.innerText || el.textContent || "").replace(/\s+/g, " ").trim();
+  // IRCTC renders this control as a text link, not a <button>, and its wrapper
+  // elements repeat the same words, so match the innermost visible element.
+  const candidates = Array.from(
+    document.querySelectorAll("button, a, span, p-button, [role='button']")
+  ).filter((el) => {
+    if (!isVisible(el) || el.disabled) return false;
+    if (el.closest("#tatkal-hud")) return false;
+    const text = shown(el);
+    return text.length > 0 && text.length <= 60 && /add\s*passenger/i.test(text);
+  });
+  const innermost = candidates.filter(
+    (el) => !candidates.some((other) => other !== el && el.contains(other))
   );
-  const text = (el) => (el.innerText || el.textContent || "").replace(/\s+/g, " ").trim();
   return (
-    candidates.find((el) => /^\+?\s*add\s*passenger$/i.test(text(el))) ||
-    candidates.find((el) => /add\s*passenger/i.test(text(el))) ||
-    null
+    innermost.find((el) => /^\+?\s*add\s*passenger/i.test(shown(el))) || innermost[0] || null
   );
 }
 
-function requestAddPassengerRow() {
+function requestAddPassengerRow(currentRows) {
   if (addPassengerClicks >= MAX_ADD_PASSENGER_CLICKS) return false;
   const now = Date.now();
-  if (now - lastAddPassengerClickAt < ADD_PASSENGER_CLICK_GAP_MS) return false;
+  const waited = now - lastAddPassengerClickAt;
+  if (waited < ADD_PASSENGER_CLICK_GAP_MS) return false;
+  // One click per row: if the last click has not produced a row yet, wait for
+  // it instead of adding a second one, which would leave a blank row that
+  // IRCTC refuses to submit.
+  if (waited < ADD_PASSENGER_SETTLE_MS && currentRows <= addPassengerRowsAtLastClick) {
+    return false;
+  }
   const btn = findAddPassengerButton();
   if (!btn) return false;
 
   lastAddPassengerClickAt = now;
+  addPassengerRowsAtLastClick = currentRows;
   addPassengerClicks += 1;
   btn.scrollIntoView({ behavior: "auto", block: "center" });
   btn.click();
@@ -2372,7 +2391,7 @@ function runAutomationStep() {
       const addsPossible =
         !!findAddPassengerButton() && addPassengerClicks < MAX_ADD_PASSENGER_CLICKS;
       if (addsPossible) {
-        requestAddPassengerRow();
+        requestAddPassengerRow(rows.length);
         setHudWarning(`Adding passenger row ${rows.length + 1} of ${passengers.length}…`);
         return;
       }
